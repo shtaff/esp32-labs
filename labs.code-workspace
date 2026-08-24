@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"name": "lora-radio-rxtx",
+			"path": "lora-radio-rxtx"
+		},
+		{
+			"name": "esp32-partitions",
+			"path": "esp32-partitions"
+		}
+	]
+}

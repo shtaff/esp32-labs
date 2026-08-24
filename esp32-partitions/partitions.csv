@@ -1,0 +1,27 @@
+# Custom partition table for this lab, 16 MB flash.
+#
+# This is the file the build turns into the 3 KB blob at flash offset 0x8000
+# that both listings read back. Editing a number here and re-flashing changes
+# what the board prints - that round trip is the whole point of the lab.
+#
+# Rules worth knowing:
+#   - the table itself lives at 0x8000 and is 0xC00 long, so nothing may start
+#     below 0x9000
+#   - app partitions must start on a 64 KB (0x10000) boundary
+#   - data partitions only need 4 KB alignment
+#   - offsets may be left blank to pack them automatically; they are spelled out
+#     here so the listing is easy to check by eye
+#   - everything must fit the actual flash size, or the board fails to boot
+#
+# "userdata" uses subtype 0x40, which is not one of the IDF's predefined data
+# subtypes. Watch how each listing copes: the raw decoder prints "?" plus the
+# hex byte, and esp_partition_find_first() still locates it by label.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xE000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x400000,
+app1,       app,  ota_1,    0x410000, 0x400000,
+spiffs,     data, spiffs,   0x810000, 0x300000,
+userdata,   data, 0x40,     0xB10000, 0x100000,
+coredump,   data, coredump, 0xC10000, 0x10000,
