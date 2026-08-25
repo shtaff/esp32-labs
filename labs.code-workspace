@@ -7,6 +7,13 @@
 		{
 			"name": "esp32-partitions",
 			"path": "esp32-partitions"
+		},
+		{
+			"name": "esp32-voice",
+			"path": "esp32-voice"
 		}
-	]
+	],
+	"settings": {
+		"lmstudioCode.minContextLength": 16384
+	}
 }
