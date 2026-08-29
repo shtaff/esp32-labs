@@ -7,6 +7,10 @@
 		{
 			"name": "esp32-partitions",
 			"path": "esp32-partitions"
+		},
+		{
+			"name": "esp32-tasks",
+			"path": "esp32-tasks"
 		}
 	]
 }
