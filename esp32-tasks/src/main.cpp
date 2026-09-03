@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <esp_task_wdt.h>
 
 #define BUTTON_PIN 14
 
@@ -16,6 +17,9 @@
 #define LED_PERIOD2 500
 #define LED_PERIOD3 1000
 #define LED_PERIOD4 2000
+
+// hang when switching to this, set anything not in period list to not hang
+#define LED_PERIOD_HANG LED_PERIOD3
 
 // onboard screen
 #define OLED_SDA 21
@@ -34,6 +38,9 @@ uint16_t periods[LED_PERIOD_CNT] = {LED_PERIOD1, LED_PERIOD2, LED_PERIOD3, LED_P
 
 QueueHandle_t buttonQueue;
 QueueHandle_t displayQueue;
+
+// only used to simulate a hang when switching to the 1000ms period, see ledTask
+SemaphoreHandle_t demoMutex;
 
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 
@@ -89,6 +96,9 @@ void buttonTask(void *pvParameters) {
 void ledTask(void *pvParameters) {
   pinMode(LED_BUILTIN, OUTPUT);
 
+  // subscribe to the Task Watchdog Timer
+  esp_task_wdt_add(NULL);
+
   uint8_t periodIndex = 0;
   bool ledOn = false;
   ButtonQueueMessage btMessage;
@@ -110,8 +120,18 @@ void ledTask(void *pvParameters) {
 
       Serial.printf("[LED Task] Period switched to %d ms\n", periods[periodIndex]);
       xQueueSend(displayQueue, &periodIndex, portMAX_DELAY);
+
+      if (periods[periodIndex] == LED_PERIOD_HANG) {
+        // xSemaphoreTake is not recursive so second call will hang
+        Serial.println("\n\n=== SIMULATING HANG ON PURPOSE (switched to 1000ms) ===\n");
+        vTaskDelay(pdMS_TO_TICKS(100));  // flush serial
+
+        xSemaphoreTake(demoMutex, portMAX_DELAY);
+        xSemaphoreTake(demoMutex, portMAX_DELAY);
+      }
     }
 
+    esp_task_wdt_reset();
     ledOn = !ledOn;
     digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
   }
@@ -169,8 +189,9 @@ void setup() {
 
   buttonQueue = xQueueCreate(5, sizeof(ButtonQueueMessage));
   displayQueue = xQueueCreate(5, sizeof(uint8_t));
+  demoMutex = xSemaphoreCreateMutex();
 
-  if (buttonQueue == NULL || displayQueue == NULL) {
+  if (buttonQueue == NULL || displayQueue == NULL || demoMutex == NULL) {
     Serial.println("[Init] Failed to create queues...");
     return;
   }
