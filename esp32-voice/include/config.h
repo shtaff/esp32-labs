@@ -288,6 +288,48 @@ enum VoiceBand {
 // Codec2 sample rate. Not a choice - every Codec2 mode below 450PWB is 8 kHz.
 #define VOICE_SAMPLE_RATE 8000
 
+// =============================================================================
+// MICROPHONE OVERSAMPLING - why capture does not run at 8 kHz
+//
+// Codec2 wants 8 kHz, but the INMP441 must not be clocked there. From its
+// datasheet:
+//
+//     WS (sample rate)   7.8 kHz .. 47.4 kHz
+//     SCK (bit clock)    0.5 MHz  .. ~4.8 MHz, typical 3.072 MHz
+//     and there must be exactly 64 SCK per WS frame
+//
+// Running Codec2's native rate directly puts us at 8.000 kHz against a 7.8 kHz
+// floor, and 512 kHz against a 500 kHz floor - inside the specification by
+// about two percent, with no margin at all. A sigma-delta decimator at the
+// very bottom of its range has a drooping passband and folds out-of-band noise
+// back into the audio. That sounds exactly like what it is: muffled, and
+// distorted on loud sounds.
+//
+// It is also invisible to every other test. The synthetic test signal, the cue
+// tones and the codec all sound perfectly clean, because none of them goes
+// anywhere near the microphone.
+//
+// So capture runs at VOICE_MIC_OVERSAMPLE x 8 kHz and is averaged back down in
+// software. At the default of 4 that is 32 kHz, or 2.048 MHz of bit clock -
+// comfortably mid-range, near the part's typical operating point.
+//
+// Set this to 1 to get the old direct-at-8-kHz behaviour back. Worth doing
+// once, to hear what the datasheet was talking about.
+//
+// The averaging is a plain box filter over VOICE_MIC_OVERSAMPLE samples. It is
+// not a great low-pass - about -2.6 dB at 3.4 kHz, the top of the speech band
+// - but it nulls exactly at the frequencies that would alias down into 8 kHz,
+// it costs four adds per output sample, and averaging uncorrelated noise gains
+// roughly 6 dB of effective resolution for nothing.
+// =============================================================================
+#ifndef VOICE_MIC_OVERSAMPLE
+#define VOICE_MIC_OVERSAMPLE 4
+#endif
+
+// Actual I2S capture rate. Playback stays at VOICE_SAMPLE_RATE, because the
+// codec's output is 8 kHz and the amplifier has no opinion about it.
+#define VOICE_MIC_CAPTURE_RATE (VOICE_SAMPLE_RATE * VOICE_MIC_OVERSAMPLE)
+
 // Codec2 mode.
 //
 //   mode   frame    samples   bytes/frame   quality
@@ -541,10 +583,39 @@ enum VoiceBand {
 // The INMP441 is a 24-bit part and we take the top 16 bits, which leaves
 // ordinary speech at maybe 5 % of full scale - too quiet for Codec2's pitch
 // estimator to lock onto. Shifting left by 3 (x8) puts a normal speaking voice
-// at a sensible level. Raise it if you have to shout, lower it if the VU meter
-// pins. Clipping saturates rather than wrapping; see audio.cpp.
+// at a sensible level.
+//
+// It also sets where the microphone clips, and that is worth knowing in real
+// units. The part is specified at -26 dBFS for 94 dB SPL, so a x8 shift means
+// full scale is reached at about 102 dB SPL. Ordinary speech at arm's length
+// is nowhere near it - but a sustained vowel two centimetres from the port
+// absolutely is, which is a very easy way to conclude the microphone is broken
+// when it is only being shouted at.
+//
+// Do not guess: audioClipCount() counts every saturated sample, and it is on
+// the AUDIO screen and in `stat`. If it climbs while you talk, drop this to 2.
+// If it stays at zero and the VU bar barely moves, raise it to 4.
 #ifndef VOICE_MIC_GAIN_SHIFT
-#define VOICE_MIC_GAIN_SHIFT 3
+#define VOICE_MIC_GAIN_SHIFT 2
+#endif
+
+// DC blocker pole, applied to captured audio before the encoder.
+//
+// Codec2 does NOT high-pass its own input. sine.c has an hpf(), and
+// codec2_create() initialises the state for it, but nothing in the encode path
+// ever calls it - so whatever DC the microphone carries goes straight into the
+// LPC and pitch analysis, where it wastes headroom and skews the model.
+//
+// The INMP441 has a real offset, so this is not theoretical. One pole:
+//
+//     y[n] = x[n] - x[n-1] + R * y[n-1]
+//
+// R = 0.97 puts the corner near 38 Hz at 8 kHz. That is deliberately well
+// below the ~85 Hz fundamental of a low male voice: this has to remove DC and
+// rumble without touching the pitch, because the pitch is most of what Codec2
+// is actually modelling.
+#ifndef VOICE_MIC_DC_POLE
+#define VOICE_MIC_DC_POLE 0.97f
 #endif
 
 // =============================================================================

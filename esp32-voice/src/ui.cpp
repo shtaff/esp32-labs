@@ -313,14 +313,19 @@ static void drawAudio() {
 
   oled.setCursor(0, 43);
   if (audioMicPresent()) {
-    oled.printf("mic ok slot%u %u%%", (unsigned)audioMicSlot(),
-                (unsigned)audioMicConfidence());
+    oled.printf("mic %luk slot%u %u%%",
+                (unsigned long)(audioCaptureRate() / 1000UL),
+                (unsigned)audioMicSlot(), (unsigned)audioMicConfidence());
   } else {
     oled.print("mic none - test tone");
   }
 
+  // "clip" is the one to watch while talking. A count that climbs means the
+  // microphone is saturating, which sounds like a fault and is not one - see
+  // VOICE_MIC_GAIN_SHIFT in config.h.
   oled.setCursor(0, 53);
-  oled.printf("under %lu  ovr %lu", (unsigned long)appUnderruns(),
+  oled.printf("clip %lu und %lu ovr %lu", (unsigned long)audioClipCount(),
+              (unsigned long)appUnderruns(),
               (unsigned long)audioCaptureTimeouts());
 }
 

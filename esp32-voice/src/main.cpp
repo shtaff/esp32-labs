@@ -23,6 +23,35 @@
 #include "link.h"
 #include "ui.h"
 
+// =============================================================================
+// setup() runs on Arduino's loopTask, whose stack is 8 kB by default. That is
+// not enough, and the way you find out is brutal:
+//
+//     [boot] codec
+//     ***ERROR*** A stack overflow in task loopTask has been detected.
+//
+// The culprit is codec2_create(). It calls make_analysis_window(), which puts
+// TWO COMP[512] arrays - the FFT working set - on the stack as locals. COMP is
+// two floats, so that is 4 kB each: 8 kB in a single frame, which is the whole
+// default stack before setup() has even called anything else.
+//
+// Nothing about this is marginal or timing-dependent; it overflows on every
+// board on every boot. It did not show up until real hardware because the
+// build is perfectly happy - stack depth is a runtime property.
+//
+// voiceTask already gets 28 kB for exactly this reason (see appBegin), but the
+// codec is CREATED during setup(), before that task exists, so it is loopTask
+// that has to survive it. 16 kB leaves about 7 kB of headroom over the peak.
+//
+// After setup() returns, loopTask only runs the serial console, which needs
+// almost none of this - the cost is 8 kB of RAM held for the life of the
+// board, out of roughly 290 kB free. Worth it to keep boot in one place.
+//
+// SET_LOOP_TASK_STACK_SIZE overrides a weak function in the Arduino core, so
+// this has to sit at file scope in the translation unit that defines setup().
+// =============================================================================
+SET_LOOP_TASK_STACK_SIZE(16384);
+
 static void bootStep(const char* what) {
   Serial.printf("[boot] %s\n", what);
   Serial.flush();
@@ -89,6 +118,20 @@ void setup() {
   consoleBegin();
 
   uiStart();
+
+  // How close the boot sequence came to the edge of loopTask's stack.
+  //
+  // This is here because a stack overflow is not a bug you debug, it is a bug
+  // you are told about after the fact by a corrupted backtrace - and the thing
+  // that overflowed it (codec2_create) is a library call whose appetite is not
+  // visible from any of our own code. Printing the margin turns the next
+  // regression from a mystery reset into a number that was getting smaller.
+  //
+  // On ESP-IDF this is in BYTES, unlike vanilla FreeRTOS where it is words.
+  Serial.printf("[boot] loopTask stack: %u bytes never used of %u\n",
+                (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                (unsigned)getArduinoLoopTaskStackSize());
+
   bootStep("ready");
 }
 

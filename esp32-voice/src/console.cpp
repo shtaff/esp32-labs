@@ -192,6 +192,12 @@ static void printStat() {
     Serial.printf("mic       INMP441 in I2S slot %u, %u%% confidence%s\n",
                   (unsigned)audioMicSlot(), (unsigned)audioMicConfidence(),
                   audioTestSignalActive() ? ", OVERRIDDEN by test signal" : "");
+    // The capture rate is not the codec rate, and that difference is the whole
+    // reason speech comes back clean rather than muffled - see config.h.
+    Serial.printf("          captured at %lu Hz (%ux oversampled), averaged "
+                  "down to %d Hz for the codec\n",
+                  (unsigned long)audioCaptureRate(),
+                  (unsigned)VOICE_MIC_OVERSAMPLE, VOICE_SAMPLE_RATE);
   } else {
     Serial.println("mic       none - PTT sends the synthetic test signal");
   }
@@ -203,6 +209,32 @@ static void printStat() {
   Serial.printf("audio     underruns %lu, capture overruns %lu, level %u%%\n",
                 (unsigned long)appUnderruns(),
                 (unsigned long)audioCaptureTimeouts(), (unsigned)audioLevel());
+  // Clipping is the difference between a broken microphone and a loud one.
+  Serial.printf("          %lu clipped samples%s\n",
+                (unsigned long)audioClipCount(),
+                audioClipCount()
+                  ? "  <- lower VOICE_MIC_GAIN_SHIFT, or back off the mic"
+                  : "");
+  // Stack headroom for every task, worst case since boot.
+  //
+  // This is here because the first thing this firmware ever did on real
+  // hardware was overflow a stack: codec2_create() puts 8 kB of FFT working
+  // set in a single frame, and Arduino's loop task has 8 kB in total. The
+  // failure mode is a reset with a corrupted backtrace, which tells you
+  // nothing at all - whereas a margin that is shrinking tells you everything.
+  //
+  // uxTaskGetStackHighWaterMark() reports the MINIMUM free the task has ever
+  // had, not a snapshot, so a healthy number here is a real guarantee. On
+  // ESP-IDF it is in bytes, unlike vanilla FreeRTOS where it is words.
+  Serial.print("stacks    ");
+  static const char* const TASKS[] = { "loopTask", "voice", "link", "btn", "ui" };
+  for (unsigned i = 0; i < sizeof(TASKS) / sizeof(TASKS[0]); i++) {
+    TaskHandle_t h = xTaskGetHandle(TASKS[i]);
+    if (h) Serial.printf("%s %u  ", TASKS[i],
+                         (unsigned)uxTaskGetStackHighWaterMark(h));
+  }
+  Serial.println("bytes never used");
+
   Serial.printf("system    up %luh%02lum%02lus, heap %lu bytes, display %s\n",
                 (unsigned long)(up / 3600), (unsigned long)((up / 60) % 60),
                 (unsigned long)(up % 60), (unsigned long)ESP.getFreeHeap(),

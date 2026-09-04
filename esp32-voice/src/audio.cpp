@@ -54,15 +54,35 @@
 //
 // Capture needs enough buffered audio to ride out the encoder: Codec2 takes a
 // large fraction of a frame period to run, and the microphone does not stop
-// while it does. 4 x 320 frames is 160 ms of slack against a 40 ms frame.
+// while it does. 120 ms is three codec frames of slack against a 40 ms frame.
 //
+// The length is derived from the capture rate rather than fixed, so that
+// changing VOICE_MIC_OVERSAMPLE changes how many samples are buffered but not
+// how much TIME they represent. Hard-coding the frame count instead would make
+// the oversampling knob secretly a latency knob - at 1x it would buffer 480 ms
+// of microphone, which is most of a syllable of lag on every transmission.
+//
+// A single DMA buffer must also stay under 4092 bytes, and 32-bit stereo is
+// 8 bytes per frame; the static_assert below holds us to it.
+#define MIC_DMA_MS    120
+#define MIC_DMA_COUNT 8
+#define MIC_DMA_LEN   ((MIC_DMA_MS * VOICE_MIC_CAPTURE_RATE / 1000) / MIC_DMA_COUNT)
+
+static_assert(MIC_DMA_LEN * 2 * sizeof(int32_t) <= 4092,
+              "microphone DMA buffer over the driver's 4092-byte limit");
+static_assert(MIC_DMA_LEN >= 64, "microphone DMA buffer implausibly small");
+
 // Playback needs much less, because decode is cheap and i2s_write() blocking
 // on a full ring is exactly the pacing mechanism we want - a deeper ring here
-// is pure added latency. 4 x 160 frames is 80 ms.
-#define MIC_DMA_COUNT 4
-#define MIC_DMA_LEN   320
+// is pure added latency. 4 x 160 frames at 8 kHz is 80 ms.
 #define SPK_DMA_COUNT 4
 #define SPK_DMA_LEN   160
+
+// Oversampling has to stay in a range the fixed buffers below were sized for,
+// and 1 (no oversampling) has to remain legal so the old behaviour can be
+// compared against directly.
+static_assert(VOICE_MIC_OVERSAMPLE >= 1 && VOICE_MIC_OVERSAMPLE <= 4,
+              "VOICE_MIC_OVERSAMPLE must be 1..4 - see config.h");
 
 static AudioDir currentDir = AUDIO_DIR_OFF;
 static bool driverInstalled = false;
@@ -72,12 +92,20 @@ static uint8_t micSlot      = 0;      // 0 or 1, the interleave index to keep
 static uint8_t micConfidence = 0;
 static bool    forceTestSignal = false;
 static uint32_t captureTimeouts = 0;
+static uint32_t clipCount = 0;
 
 static uint8_t level = 0;
 
-// Scratch. Static rather than on the stack: 2560 bytes is more than voiceTask
-// wants to lose, and there is exactly one caller of each.
-static int32_t micRaw[2 * VOICE_MAX_SAMPLES_PER_FRAME];
+// DC blocker state, carried between frames. Reset whenever capture starts, so
+// the settling transient of one transmission cannot ring into the next.
+static float dcPrevIn = 0.0f;
+static float dcPrevOut = 0.0f;
+
+// Scratch. Static rather than on the stack: at 4x oversampling this is 10 kB,
+// which voiceTask would rather not lose, and there is exactly one caller of
+// each. Sized for the worst case - the longest codec frame, both I2S slots,
+// and the highest oversampling factor.
+static int32_t micRaw[2 * VOICE_MAX_SAMPLES_PER_FRAME * VOICE_MIC_OVERSAMPLE];
 static int16_t spkRaw[2 * VOICE_MAX_SAMPLES_PER_FRAME];
 
 // -----------------------------------------------------------------------------
@@ -112,7 +140,10 @@ static bool install(AudioDir dir) {
 
   i2s_config_t cfg = {};
   cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | (rx ? I2S_MODE_RX : I2S_MODE_TX));
-  cfg.sample_rate = VOICE_SAMPLE_RATE;
+  // Capture is oversampled and averaged down in software; playback is not,
+  // because the codec's output is already 8 kHz. See the oversampling section
+  // of config.h for why the microphone must not be clocked at 8 kHz.
+  cfg.sample_rate = rx ? VOICE_MIC_CAPTURE_RATE : VOICE_SAMPLE_RATE;
   // 32 bits for capture because the INMP441 is a 24-bit part in a 32-bit slot
   // and the top bits are where the audio is; 16 for playback because that is
   // what the codec produces and what the amplifier wants.
@@ -251,6 +282,9 @@ uint8_t audioMicSlot()      { return micSlot; }
 uint8_t audioMicConfidence(){ return micConfidence; }
 AudioDir audioDirection()   { return currentDir; }
 uint32_t audioCaptureTimeouts() { return captureTimeouts; }
+uint32_t audioClipCount()   { return clipCount; }
+void     audioResetClipCount() { clipCount = 0; }
+uint32_t audioCaptureRate() { return VOICE_MIC_CAPTURE_RATE; }
 
 bool audioAmpEnabled() {
 #ifdef NO_AMP
@@ -298,6 +332,12 @@ void audioSetDirection(AudioDir dir) {
       if (i2s_read(I2S_PORT, micRaw, sizeof(micRaw), &got, 0) != ESP_OK) break;
       if (got < sizeof(micRaw)) break;
     }
+
+    // Start the DC blocker from rest. Carrying state across a direction change
+    // would let the settling transient of one transmission ring into the
+    // start of the next, which is a thud on exactly the syllable you wanted.
+    dcPrevIn = 0.0f;
+    dcPrevOut = 0.0f;
   }
 
   currentDir = dir;
@@ -403,14 +443,18 @@ uint8_t audioLevel()      { return level; }
 
 bool audioCaptureFrame(int16_t* dst) {
   const int n = codecSamplesPerFrame();
-  const size_t want = (size_t)n * 2 * sizeof(int32_t);
+
+  // One codec frame of output needs VOICE_MIC_OVERSAMPLE input samples each,
+  // and every input sample arrives as a stereo pair of 32-bit words.
+  const int    raw  = n * VOICE_MIC_OVERSAMPLE;
+  const size_t want = (size_t)raw * 2 * sizeof(int32_t);
 
   bool ok = true;
   if (currentDir == AUDIO_DIR_MIC) {
     size_t got = 0;
-    // Four frame periods of patience. The DMA ring holds four frames, so
-    // anything longer than this means the ring has already overrun and the
-    // audio is broken in a way waiting will not fix.
+    // Four frame periods of patience. The DMA ring holds three codec frames'
+    // worth, so anything longer than this means the ring has already overrun
+    // and the audio is broken in a way that waiting will not fix.
     esp_err_t rc = i2s_read(I2S_PORT, micRaw, want, &got,
                             pdMS_TO_TICKS(codecFrameMs() * 4));
     if (rc != ESP_OK || got < want) {
@@ -432,16 +476,40 @@ bool audioCaptureFrame(int16_t* dst) {
     // output is discarded; only the timing was wanted.
     generateTestSignal(dst, n);
   } else {
-    // Keep the slot the probe identified, drop the other, and move the 24-bit
-    // sample down into int16 with the configured gain folded into the shift.
-    // Saturating rather than wrapping matters: a wrapped overload inverts the
-    // waveform and Codec2 turns that into a bark.
-    const int shift = 16 - VOICE_MIC_GAIN_SHIFT;
+    // ----------------------------------------------------------------------
+    // Decimate, scale, block DC, saturate.
+    //
+    // The scale factor is the gain shift expressed as a multiply so it can be
+    // applied in floating point BEFORE the DC blocker. Shifting first would
+    // throw away the low bits the blocker needs to track a slowly drifting
+    // offset - which is most of what it is for.
+    // ----------------------------------------------------------------------
+    const float scale = 1.0f / (float)(1UL << (16 - VOICE_MIC_GAIN_SHIFT));
+
     for (int i = 0; i < n; i++) {
-      int32_t v = micRaw[i * 2 + micSlot] >> shift;
-      if (v >  32767) v =  32767;
-      if (v < -32768) v = -32768;
-      dst[i] = (int16_t)v;
+      // Box-average VOICE_MIC_OVERSAMPLE consecutive samples of the slot the
+      // boot probe identified, discarding the other slot. int64 because four
+      // full-scale 32-bit samples do not fit in an int32 accumulator.
+      int64_t acc = 0;
+      for (int k = 0; k < VOICE_MIC_OVERSAMPLE; k++) {
+        acc += micRaw[((size_t)(i * VOICE_MIC_OVERSAMPLE + k)) * 2 + micSlot];
+      }
+      float s = (float)(acc / VOICE_MIC_OVERSAMPLE) * scale;
+
+      // One-pole DC blocker: y = x - x1 + R*y1. Codec2 does not high-pass its
+      // own input, and the INMP441 has a real offset, so without this the
+      // offset goes straight into the LPC analysis.
+      const float y = s - dcPrevIn + VOICE_MIC_DC_POLE * dcPrevOut;
+      dcPrevIn  = s;
+      dcPrevOut = y;
+      s = y;
+
+      // Saturate rather than wrap: a wrapped overload inverts the waveform,
+      // and Codec2 renders that as a bark. Count it, because "clipping" and
+      // "broken microphone" sound the same and are fixed differently.
+      if (s > 32767.0f)       { s = 32767.0f;  clipCount++; }
+      else if (s < -32768.0f) { s = -32768.0f; clipCount++; }
+      dst[i] = (int16_t)s;
     }
   }
 

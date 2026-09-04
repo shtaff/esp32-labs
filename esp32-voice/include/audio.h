@@ -116,3 +116,18 @@ void    audioResetLevel();
 // Times audioCaptureFrame() found no data ready. Non-zero means the codec is
 // not keeping up with the microphone; check codecEncodeUs().
 uint32_t audioCaptureTimeouts();
+
+// Microphone samples that saturated on the way to the codec.
+//
+// This is the number that separates "the microphone is broken" from "you are
+// shouting into it", which sound identical and are fixed very differently. A
+// climbing count while you talk means VOICE_MIC_GAIN_SHIFT is too high, or the
+// microphone is too close to your mouth. Zero, with a VU bar that barely
+// moves, means the opposite.
+uint32_t audioClipCount();
+void     audioResetClipCount();
+
+// The rate the I2S peripheral is actually clocking the microphone at, which is
+// VOICE_MIC_OVERSAMPLE times the codec's 8 kHz. See the oversampling section
+// of config.h for why it is not simply 8 kHz.
+uint32_t audioCaptureRate();

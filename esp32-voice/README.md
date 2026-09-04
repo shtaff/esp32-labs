@@ -163,6 +163,56 @@ each, and takes the slot that scores over 90 % and is not stuck at a constant.
 Since that also answers *which* slot, the L/R strap on the breakout is a
 don't-care. The AUDIO screen shows the slot and the confidence.
 
+### ⚠ The microphone is not clocked at 8 kHz
+
+Codec2 wants 8 kHz. The INMP441 must not be run there. From its datasheet:
+
+| | |
+| --- | --- |
+| WS (sample rate) | 7.8 kHz – 47.4 kHz |
+| SCK (bit clock) | 0.5 MHz – ~4.8 MHz, typical 3.072 MHz |
+| | exactly 64 SCK per WS frame |
+
+Clocking Codec2's native rate directly puts you at **8.000 kHz against a
+7.8 kHz floor** and **512 kHz against a 500 kHz floor** — inside spec by about
+2 %, with no margin at all. A sigma-delta decimator at the very bottom of its
+range has a drooping passband and folds out-of-band noise back into the audio.
+It sounds exactly like what it is: **muffled, and distorted on loud sounds**.
+
+So capture runs at `VOICE_MIC_OVERSAMPLE × 8 kHz` (default 4 → **32 kHz**,
+2.048 MHz of bit clock) and is box-averaged back down to 8 kHz in software. The
+averaging nulls precisely at the frequencies that would alias into 8 kHz, costs
+four adds per output sample, and buys ~6 dB of effective resolution for free.
+
+Set `-DVOICE_MIC_OVERSAMPLE=1` to hear the original behaviour — worth doing
+once, because it is a very clean demonstration of what a datasheet minimum
+actually means.
+
+This is a nasty bug to find, because **every other test passes**. The cue tones,
+the synthetic test signal and the codec all sound perfect: none of them goes
+anywhere near the microphone. See [Troubleshooting](#troubleshooting) for the
+`tone on` trick that isolates it in about thirty seconds.
+
+### Level, and the difference between broken and loud
+
+Codec2 does **not** high-pass its input — `sine.c` has an `hpf()` and
+`codec2_create()` initialises state for it, but nothing in the encode path ever
+calls it. The INMP441 has a real DC offset, so a one-pole DC blocker
+(`VOICE_MIC_DC_POLE`, corner ≈ 38 Hz) runs before the encoder. The corner is
+deliberately well below a low male voice's ~85 Hz fundamental: it has to remove
+offset and rumble without touching the pitch, because the pitch is most of what
+Codec2 is modelling.
+
+Gain is `VOICE_MIC_GAIN_SHIFT`, default ×8. That also sets where the microphone
+clips: the part is specified at −26 dBFS for 94 dB SPL, so ×8 saturates at
+about **102 dB SPL** — nowhere near ordinary speech, but very reachable with a
+sustained vowel two centimetres from the port. That is an easy way to conclude
+the microphone is broken when it is only being shouted at.
+
+Don't guess. **`clip` on the AUDIO screen and in `stat` counts every saturated
+sample.** Climbing while you talk → drop the shift to 2, or back off the mic.
+Stuck at zero with a VU bar that barely moves → raise it to 4.
+
 ---
 
 ## Presets
@@ -502,6 +552,15 @@ amplifier is verified.
 whole audio chain is good and the fault is in the radio. If it doesn't, the radio
 is irrelevant until you've fixed the audio.
 
+Then bisect the audio chain itself — each step adds exactly one stage, so
+whichever one first sounds wrong contains the fault:
+
+| Test | Exercises | If it's clean |
+| --- | --- | --- |
+| `beep on` | I2S TX, amp, speaker | output path is good |
+| `tone on` + preset 7 | ...plus Codec2 encode/decode | the codec is good too |
+| preset 7, speaking | ...plus mic, gain, DC blocker | everything is good |
+
 | Symptom | Look at |
 | --- | --- |
 | Nothing received | Same **preset number** on both? Different modems can't hear each other at all. `stat` on each. |
@@ -515,8 +574,10 @@ is irrelevant until you've fixed the audio.
 | Range collapsed | On an FSK preset? That's the 17 dB, working as designed. |
 | `SNR n/a` | FSK preset — the SX1276 has no SNR estimator outside LoRa. |
 | Silence, mic fitted | AUDIO screen says `mic none`? Check GPIO34 and 3V3. Then try preset 7. |
+| **Voice muffled / distorted, beeps clean** | The beep never touches the mic, so this is the capture path. Run `tone on` then preset 7: if the synthetic vowel is clean, the codec is fine too. Check `clip` on the AUDIO screen — if it climbs you are just loud. If not, you are probably running `VOICE_MIC_OVERSAMPLE=1`. |
 | Hiss from the speaker | DIN not on GPIO13, or a microSD card is fitted. |
 | Board resets ~900 ms in | Something touched GPIO16/17. |
+| `stack overflow in task loopTask` | Something heavy was added to `setup()`. `codec2_create()` alone puts 8 kB of FFT working set in one frame — see `SET_LOOP_TASK_STACK_SIZE` in [main.cpp](src/main.cpp), and check the `stacks` line in `stat`. |
 | `packet too long` at compile time | `VOICE_FRAMES_PER_PACKET` pushed the packet past the 64-byte FSK FIFO. |
 
 ---
