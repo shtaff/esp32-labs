@@ -131,3 +131,10 @@ void     audioResetClipCount();
 // VOICE_MIC_OVERSAMPLE times the codec's 8 kHz. See the oversampling section
 // of config.h for why it is not simply 8 kHz.
 uint32_t audioCaptureRate();
+
+// Microphone gain as a left shift, 0..6. Settable at runtime because it is
+// the knob you most often need to move while listening to the result, and
+// waiting for a rebuild to hear the difference makes that a slow loop.
+// Persisted as `micgain` in the config store.
+void    audioSetGainShift(uint8_t shift);
+uint8_t audioGainShift();

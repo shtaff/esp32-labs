@@ -18,10 +18,14 @@
 #include "audio.h"
 #include "codec.h"
 #include "config.h"
+#include "post.h"
+#include "configstore.h"
 #include "console.h"
 #include "crypto.h"
 #include "link.h"
+#include "log.h"
 #include "ui.h"
+#include "version.h"
 
 // =============================================================================
 // setup() runs on Arduino's loopTask, whose stack is 8 kB by default. That is
@@ -75,7 +79,24 @@ void setup() {
 
   Serial.println();
   Serial.println("=== LoRa digital voice handset ===");
+  // Version first, before anything can go wrong. A boot log that crashes half
+  // way through is still useful if it named the build before it did.
+  Serial.printf("[boot] firmware %s, protocol v%u, built %s\n",
+                versionString(), (unsigned)VOICE_PROTO_VERSION,
+                versionBuildTimestamp());
   Serial.flush();
+
+  // The log first, so that everything after this point can be recorded - and
+  // so the reset reason is captured before anything has a chance to overwrite
+  // the evidence. It also tells us straight away whether the ring survived,
+  // which is the difference between a reboot and a power cycle.
+  bootStep("log");
+  logBegin();
+  if (logSurvivedReset()) {
+    Serial.printf("[boot] log ring survived a reset - %lu records from boot #%lu, "
+                  "`log` to read them\n",
+                  (unsigned long)logCount(), (unsigned long)logBootCount());
+  }
 
   bootStep("led");
   ledBegin();
@@ -84,7 +105,14 @@ void setup() {
   uiBegin();
   uiBanner("VOICE", "starting");
 
-  // Crypto first, because it is the only step whose failure is not fatal but
+  // Settings before anything that reads them, which is nearly everything:
+  // the key, the station id, the boot preset, the microphone gain and the
+  // cue tones all come from here. It never fails - a board with unreadable
+  // settings falls back to build-time defaults and says so.
+  bootStep("config");
+  configBegin();
+
+  // Crypto next, because it is the only step whose failure is not fatal but
   // does change what the rest of the firmware is allowed to do. Getting the
   // answer before anything can offer to arm encryption keeps that honest.
   bootStep("crypto");
@@ -119,6 +147,12 @@ void setup() {
 
   uiStart();
 
+  // POST last, because nearly everything it reports is the outcome of the
+  // initialisation above - and because the codec timing check needs the
+  // codec, and the stack check needs the tasks to exist.
+  bootStep("post");
+  postRun();
+
   // How close the boot sequence came to the edge of loopTask's stack.
   //
   // This is here because a stack overflow is not a bug you debug, it is a bug
@@ -139,5 +173,21 @@ void setup() {
 // job that genuinely wants to be lowest priority and is allowed to be slow.
 void loop() {
   consolePoll();
+
+  // Flush the event log to flash when it is due and nothing time-critical is
+  // running. The idle test is the important argument: esp_partition_write
+  // disables the instruction cache on BOTH cores while it runs, so a flush
+  // during a transmission would stall the codec and glitch the audio.
+  //
+  // loop() is the right place for it - lowest priority in the system, allowed
+  // to be slow, and already the home of everything else that is not urgent.
+  logService(appState() == VOICE_IDLE);
+
+  // Commits a deferred "remember the last preset" save once the operator has
+  // stopped pressing the button. Same reasoning as the log flush above: the
+  // write happens here, at the lowest priority in the system, and never in
+  // the task that changed the setting.
+  configService();
+
   delay(10);
 }

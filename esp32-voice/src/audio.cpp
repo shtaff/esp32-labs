@@ -47,6 +47,8 @@
 
 #include "codec.h"
 #include "config.h"
+#include "configstore.h"
+#include "log.h"
 
 #define I2S_PORT I2S_NUM_0
 
@@ -95,6 +97,17 @@ static uint32_t captureTimeouts = 0;
 static uint32_t clipCount = 0;
 
 static uint8_t level = 0;
+
+// Live settings, adopted from the config store in audioBegin() and changeable
+// at runtime through `config set`. They are plain variables rather than the
+// build-time constants they default to, because a field marked "live" has to
+// take effect without a restart - and gain in particular is the knob you need
+// to move while listening to the result.
+static bool    cuesOn    = true;
+static uint8_t gainShift = VOICE_MIC_GAIN_SHIFT;
+
+void    audioSetGainShift(uint8_t s) { gainShift = (s > 6) ? 6 : s; }
+uint8_t audioGainShift()             { return gainShift; }
 
 // DC blocker state, carried between frames. Reset whenever capture starts, so
 // the settling transient of one transmission cannot ring into the next.
@@ -255,10 +268,21 @@ static void audioProbeMic() {
     Serial.println("[audio] PTT will transmit the synthetic test signal instead");
   }
 
+  // Slot as `a`, confidence as `b`; a == -1 means nothing was found. This
+  // is the record that answers "was the microphone even detected" weeks
+  // later, without anyone having to have been watching the boot log.
+  logInfo(LOG_MOD_AUDIO, LOG_EV_MIC_PROBE,
+          micPresent ? (int32_t)best : -1, (int32_t)pct);
+
   uninstall();
 }
 
 bool audioBegin() {
+  // Adopt the stored settings before the probe runs, so the boot log and
+  // the first captured frame already reflect what the operator configured.
+  gainShift = config().micGainShift;
+  cuesOn    = config().cueTones != 0;
+
   holdAmpSilent();
 
   audioProbeMic();
@@ -484,7 +508,7 @@ bool audioCaptureFrame(int16_t* dst) {
     // throw away the low bits the blocker needs to track a slowly drifting
     // offset - which is most of what it is for.
     // ----------------------------------------------------------------------
-    const float scale = 1.0f / (float)(1UL << (16 - VOICE_MIC_GAIN_SHIFT));
+    const float scale = 1.0f / (float)(1UL << (16 - gainShift));
 
     for (int i = 0; i < n; i++) {
       // Box-average VOICE_MIC_OVERSAMPLE consecutive samples of the slot the
@@ -555,7 +579,6 @@ static const CueDef CUES[] = {
   { CUE_LOST,     3 },
 };
 
-static bool cuesOn = (VOICE_CUE_TONES != 0);
 
 void audioSetCues(bool on)  { cuesOn = on; }
 bool audioCuesEnabled()     { return cuesOn; }

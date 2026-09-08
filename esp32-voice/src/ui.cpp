@@ -27,6 +27,8 @@
 #include "config.h"
 #include "crypto.h"
 #include "link.h"
+#include "post.h"
+#include "version.h"
 
 #ifndef NO_DISPLAY
 static Adafruit_SSD1306 oled(128, 64, &Wire, PIN_OLED_RST);
@@ -376,6 +378,37 @@ static void drawSys() {
 #endif  // NO_DISPLAY
 
 // -----------------------------------------------------------------------------
+// VERSION - which firmware this board is running, and where it came from.
+//
+// This is the screen you read out loud when two boards behave differently. The
+// git hash is the part that matters; the "*" after it means the tree had
+// uncommitted changes, so the hash does NOT identify the source.
+// -----------------------------------------------------------------------------
+static void drawVersion() {
+  drawHeader("VERSION");
+  oled.setTextSize(1);
+
+  // Semver large enough to read across a bench.
+  oled.setTextSize(2);
+  oled.setCursor(0, 14);
+  oled.print(versionSemver());
+  oled.setTextSize(1);
+
+  oled.setCursor(0, 34);
+  oled.printf("git %s%s", versionGitRev(), versionGitDirty() ? " *DIRTY" : "");
+
+  oled.setCursor(0, 44);
+  // The branch is truncated rather than wrapped: 21 characters is the whole
+  // line, and a wrapped line would eat the row below it.
+  oled.printf("%-.21s", versionGitBranch());
+
+  oled.setCursor(0, 54);
+  // The POST verdict shares this line with the build date: both are things you
+  // read once when you pick the board up, and neither needs a line of its own.
+  oled.printf("%-.10s %s", versionBuildTimestamp(), postSummary());
+}
+
+// -----------------------------------------------------------------------------
 // The task. Two jobs at two different rates, which is why the loop is shaped
 // the way it is - see the comment at the bottom of it.
 // -----------------------------------------------------------------------------
@@ -399,6 +432,7 @@ static void uiTask(void* arg) {
           case UI_SCREEN_LINK:  drawLink();  break;
           case UI_SCREEN_AUDIO: drawAudio(); break;
           case UI_SCREEN_SYS:   drawSys();   break;
+          case UI_SCREEN_VERSION: drawVersion(); break;
           default:              drawMain();  break;
         }
       }

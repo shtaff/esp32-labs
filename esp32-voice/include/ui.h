@@ -19,10 +19,11 @@
 #include <stdint.h>
 
 enum UiScreen {
-  UI_SCREEN_MAIN = 0,   // state, channel, encryption, signal, VU meter
+  UI_SCREEN_MAIN = 0,   // state, preset, encryption, signal, VU meter
   UI_SCREEN_LINK,       // packet counters, loss, RSSI/SNR, duty cycle
   UI_SCREEN_AUDIO,      // codec mode and cost, microphone, underruns
-  UI_SCREEN_SYS,        // heap, uptime, key fingerprint, build settings
+  UI_SCREEN_SYS,        // heap, uptime, key fingerprint, modem settings
+  UI_SCREEN_VERSION,    // firmware version, git provenance, POST verdict
   UI_SCREEN_COUNT,
 };
 

@@ -21,8 +21,12 @@
 #include "buttons.h"
 #include "codec.h"
 #include "config.h"
+#include "post.h"
+#include "configstore.h"
 #include "crypto.h"
 #include "link.h"
+#include "log.h"
+#include "version.h"
 #include "ui.h"
 
 static char line[64];
@@ -37,10 +41,21 @@ static void printHelp() {
   Serial.println();
   Serial.println("  help              this list");
   Serial.println("  stat              everything the display screens show");
+  Serial.println("  version           firmware version and git provenance");
+  Serial.println("  log               event log from RTC (survives a reset)");
+  Serial.println("    log flash       from flash (survives power off)");
+  Serial.println("    log raw|flash raw   hex, for offline decoding");
+  Serial.println("    log flush       write pending records to flash now");
+  Serial.println("    log clear|erase wipe the RTC ring | the flash history");
+  Serial.println("  config            show settings; get/set/reset");
+  Serial.println("                    set many at once, in ONE write:");
+  Serial.println("                      config set station=7 preset=5 cues=off");
+  Serial.println("    config test     verify the v1 -> v2 migration on this board");
+  Serial.println("  post              re-run the power-on self test");
   Serial.println("  presets           list the preset table");
   Serial.println("  preset [0-7]      show or set the preset (alias: ch)");
   Serial.println("  enc [on|off]      show or set encryption");
-  Serial.println("  screen [0-3]      show or set the display screen");
+  Serial.println("  screen [0-4]      show or set the display screen");
   Serial.println("  ptt [ms]          key up for ms (default 3000), then release");
   Serial.println("  tone [on|off]     force the synthetic test signal");
   Serial.println("  beep [on|off]     cue tones at the edges of a transmission");
@@ -48,6 +63,341 @@ static void printHelp() {
   Serial.println();
   Serial.println("  On the self-test preset, `ptt` records and plays back locally");
   Serial.println("  instead of transmitting - the radio stays in standby.");
+  Serial.println();
+}
+
+// -----------------------------------------------------------------------------
+// The event log, decoded for a human.
+//
+// Oldest first, because you read a log forwards. The timestamp restarts at
+// every boot, and because the ring survives a reset there can be several boots
+// in one dump - the BOOT records are the boundaries, and their `b` field is
+// the boot number.
+// -----------------------------------------------------------------------------
+static void printLog() {
+  const uint16_t n = logCount();
+
+  Serial.println();
+  // The threshold first: a log that looks emptier than expected is nearly
+  // always a threshold somebody raised and forgot, and that answer should be
+  // on the same screen as the symptom.
+  Serial.printf("log       minimum level %s (records below it were never stored)\n",
+                logLevelName(logMinLevel()));
+  Serial.printf("          %u records held, %lu written since clear, boot #%lu%s\n",
+                (unsigned)n, (unsigned long)logTotalWritten(),
+                (unsigned long)logBootCount(),
+                logSurvivedReset() ? ", ring survived the last reset"
+                                   : ", ring was initialised this boot");
+  if (logTotalWritten() > n) {
+    Serial.printf("          %lu older records were overwritten by the ring\n",
+                  (unsigned long)(logTotalWritten() - n));
+  }
+  Serial.println();
+  Serial.println("     time  L  module  event             a           b");
+  Serial.println("  -------  -  ------  ----------------  ----------  ----------");
+
+  LogRecord r;
+  for (uint16_t i = 0; i < n; i++) {
+    if (!logRead(i, &r)) break;
+
+    // An event this build does not know about prints as its number rather
+    // than being dropped - a dump from a newer firmware is still readable.
+    const char* name = logEventName(r.code);
+    char label[20];
+    if (name[0] == '\0') snprintf(label, sizeof(label), "event %u", (unsigned)r.code);
+    else                 snprintf(label, sizeof(label), "%s", name);
+
+    Serial.printf("  %4lu.%03lu  %s  %-6s  %-16s  %10ld  %10ld\n",
+                  (unsigned long)(r.ms / 1000UL), (unsigned long)(r.ms % 1000UL),
+                  logLevelName(r.level), logModuleName(r.module), label,
+                  (long)r.a, (long)r.b);
+  }
+  Serial.println();
+}
+
+// -----------------------------------------------------------------------------
+// The same records as hex, for archiving or offline decoding.
+//
+// One line per record, 32 hex characters, little-endian exactly as stored -
+// so a decoder can consume it with a struct unpack and nothing else. The
+// header names the format version and the record count so the dump is
+// self-describing: a file recovered from a terminal scrollback months later
+// should not need to be matched up with the firmware that produced it.
+//
+// See docs/02-logging.md for a decoder.
+// -----------------------------------------------------------------------------
+static void printLogRaw() {
+  const uint16_t n = logCount();
+
+  Serial.println();
+  Serial.printf("#VOICELOG v%u records=%u size=%u boots=%lu total=%lu\n",
+                (unsigned)LOG_FORMAT_VERSION, (unsigned)n,
+                (unsigned)sizeof(LogRecord), (unsigned long)logBootCount(),
+                (unsigned long)logTotalWritten());
+
+  LogRecord r;
+  for (uint16_t i = 0; i < n; i++) {
+    if (!logRead(i, &r)) break;
+    const uint8_t* p = (const uint8_t*)&r;
+    char line[2 * sizeof(LogRecord) + 1];
+    for (unsigned b = 0; b < sizeof(LogRecord); b++) {
+      snprintf(line + b * 2, 3, "%02X", p[b]);
+    }
+    Serial.println(line);
+  }
+  Serial.println("#END");
+  Serial.println();
+}
+
+// -----------------------------------------------------------------------------
+// The flash-backed history - the half that survives power being removed.
+//
+// Same records, same decoding, a different and much longer source. Records
+// flagged `torn` are half-written ones left by a power cut mid-flush; there
+// can be at most one per cut and it is always the newest, so seeing one is
+// informative rather than alarming.
+// -----------------------------------------------------------------------------
+static void printLogFlash(bool raw) {
+  if (!logFlashAvailable()) {
+    Serial.println("no `eventlog` partition - nothing survives power off");
+    return;
+  }
+
+  const uint32_t n = logFlashCount();
+  Serial.println();
+  Serial.printf("flash log %lu of %lu records, %lu still only in RTC\n",
+                (unsigned long)n, (unsigned long)logFlashCapacity(),
+                (unsigned long)logUnflushed());
+
+  if (raw) {
+    Serial.printf("#VOICELOG v%u records=%lu size=%u source=flash\n",
+                  (unsigned)LOG_FORMAT_VERSION, (unsigned long)n,
+                  (unsigned)sizeof(LogRecord));
+  } else {
+    Serial.println();
+    Serial.println("     time  L  module  event             a           b");
+    Serial.println("  -------  -  ------  ----------------  ----------  ----------");
+  }
+
+  LogRecord r;
+  bool torn = false;
+  for (uint32_t i = 0; i < n; i++) {
+    if (!logFlashRead(i, &r, &torn)) break;
+
+    if (raw) {
+      const uint8_t* p = (const uint8_t*)&r;
+      char line[2 * sizeof(LogRecord) + 1];
+      for (unsigned b = 0; b < sizeof(LogRecord); b++) {
+        snprintf(line + b * 2, 3, "%02X", p[b]);
+      }
+      Serial.println(line);
+      continue;
+    }
+
+    if (torn) {
+      Serial.println("  <torn record - power was lost part way through a write>");
+      continue;
+    }
+
+    const char* name = logEventName(r.code);
+    char label[20];
+    if (name[0] == '\0') snprintf(label, sizeof(label), "event %u", (unsigned)r.code);
+    else                 snprintf(label, sizeof(label), "%s", name);
+
+    Serial.printf("  %4lu.%03lu  %s  %-6s  %-16s  %10ld  %10ld\n",
+                  (unsigned long)(r.ms / 1000UL), (unsigned long)(r.ms % 1000UL),
+                  logLevelName(r.level), logModuleName(r.module), label,
+                  (long)r.a, (long)r.b);
+  }
+  if (raw) Serial.println("#END");
+  Serial.println();
+}
+
+// -----------------------------------------------------------------------------
+// Push the live settings at the modules that own them.
+//
+// The config store persists; it deliberately does not reach into other
+// modules. Doing it here keeps the dependency pointing one way, and means the
+// store can be tested without a radio or an I2S peripheral attached.
+// -----------------------------------------------------------------------------
+static void applyLiveSettings() {
+  audioSetGainShift(config().micGainShift);
+  audioSetCues(config().cueTones != 0);
+  logSetMinLevel(configLogLevel());
+  // Switching to "remember last used" should capture where the handset is
+  // NOW, not wait until the next time somebody touches the button.
+  configNotePreset(linkPresetIndex());
+  // preroll and txmax are read from config() where they are used, every time,
+  // so there is nothing to push for those two.
+}
+
+// -----------------------------------------------------------------------------
+// `config set`, in two forms.
+//
+//     config set station 7                     one field, space separated
+//     config set station=7 preset=5 cues=off   several fields, ONE flash write
+//
+// The second form is not just shorthand. Setting five fields one at a time is
+// five NVS writes and five chances to lose power part way through; it is also
+// five chances to end up half-configured, because a typo in the fourth value
+// leaves the first three applied. Staging everything, validating everything,
+// and then writing once collapses that into a single all-or-nothing operation.
+//
+// A rejection anywhere aborts the whole batch and the stored config is left
+// exactly as it was - which is the property worth having, and the reason the
+// error message names the field that failed.
+// -----------------------------------------------------------------------------
+static void configSet(const char* rest) {
+  if (*rest == '\0') {
+    Serial.println("usage: config set <name> <value>");
+    Serial.println("       config set <name>=<value> [<name>=<value> ...]");
+    return;
+  }
+
+  // Which form? A '=' anywhere means the batch form. Checking for it rather
+  // than counting spaces keeps `config set key <hex>` working unchanged.
+  const bool batch = strchr(rest, '=') != nullptr;
+
+  configBatchBegin();
+  uint8_t staged = 0;
+
+  if (!batch) {
+    char name[16] = "";
+    const char* sp = strchr(rest, ' ');
+    if (sp == nullptr || sp == rest) {
+      Serial.println("usage: config set <name> <value>");
+      configBatchAbort();
+      return;
+    }
+    const size_t len = (size_t)(sp - rest);
+    if (len >= sizeof(name)) {
+      Serial.println("setting name too long");
+      configBatchAbort();
+      return;
+    }
+    memcpy(name, rest, len);
+    name[len] = '\0';
+    while (*sp == ' ') sp++;
+
+    const char* err = nullptr;
+    if (!configBatchStage(name, sp, &err)) {
+      Serial.printf("rejected: %s\n", err ? err : "invalid");
+      configBatchAbort();
+      return;
+    }
+    staged = 1;
+
+  } else {
+    // Walk space-separated name=value tokens. Everything is staged before
+    // anything is written, so the first bad token aborts with nothing changed.
+    const char* p = rest;
+    while (*p) {
+      while (*p == ' ') p++;
+      if (!*p) break;
+
+      const char* tokEnd = p;
+      while (*tokEnd && *tokEnd != ' ') tokEnd++;
+
+      const char* eq = (const char*)memchr(p, '=', (size_t)(tokEnd - p));
+      if (eq == nullptr || eq == p || eq + 1 == tokEnd) {
+        Serial.printf("rejected: '%.*s' is not name=value - nothing was changed\n",
+                      (int)(tokEnd - p), p);
+        configBatchAbort();
+        return;
+      }
+
+      char name[16];
+      char value[40];
+      const size_t nlen = (size_t)(eq - p);
+      const size_t vlen = (size_t)(tokEnd - eq - 1);
+      if (nlen >= sizeof(name) || vlen >= sizeof(value)) {
+        Serial.println("rejected: name or value too long - nothing was changed");
+        configBatchAbort();
+        return;
+      }
+      memcpy(name, p, nlen);   name[nlen] = '\0';
+      memcpy(value, eq + 1, vlen); value[vlen] = '\0';
+
+      const char* err = nullptr;
+      if (!configBatchStage(name, value, &err)) {
+        Serial.printf("rejected: %s - nothing was changed\n", err ? err : "invalid");
+        configBatchAbort();
+        return;
+      }
+      staged++;
+      p = tokEnd;
+    }
+  }
+
+  if (staged == 0) {
+    Serial.println("nothing to set");
+    configBatchAbort();
+    return;
+  }
+
+  const uint32_t changed = configBatchChanged();
+  if (!configBatchCommit()) {
+    Serial.println("values were accepted but the NVS write failed - nothing saved");
+    return;
+  }
+  applyLiveSettings();
+
+  // Report every field that moved, reading each back from the stored config
+  // rather than echoing what was typed - so the line confirms what is now
+  // true, not what was asked for.
+  Serial.printf("%u setting%s saved in one write\n",
+                (unsigned)staged, staged == 1 ? "" : "s");
+  char value[24];
+  for (uint8_t i = 0; i < configFieldCount(); i++) {
+    if (!(changed & (1UL << i))) continue;
+    configFieldValue(i, value, sizeof(value));
+    Serial.printf("  %-7s = %-10s %s\n", configFieldName(i), value,
+                  configFieldIsLive(i) ? "" : "(takes effect after a restart)");
+  }
+  if (configRestartPending()) Serial.println("  `reboot` to apply");
+}
+
+// -----------------------------------------------------------------------------
+// The settings table.
+//
+// Shows where the running configuration came from, then every field with its
+// value, its allowed range, whether a change takes effect now or at the next
+// boot, and whether it still holds its build-time default. That last column is
+// the one that answers "what has somebody changed on this board?", which is
+// usually the real question.
+// -----------------------------------------------------------------------------
+static void printConfig() {
+  Serial.println();
+  Serial.printf("source    %s\n", configLoadResultName(configLoadResult()));
+  Serial.printf("version   config v%u, %u bytes%s\n",
+                (unsigned)config().version, (unsigned)config().size,
+                configLoadResult() == CFG_LOAD_MIGRATED
+                  ? "  (migrated on this boot)" : "");
+  if (configLoadResult() == CFG_LOAD_MIGRATED) {
+    Serial.printf("          written as v%u, upgraded in place and saved\n",
+                  (unsigned)configStoredVersion());
+  }
+  Serial.println();
+  Serial.println("  name     value       range     when      set?");
+  Serial.println("  -------  ----------  --------  --------  ----");
+
+  char value[24];
+  for (uint8_t i = 0; i < configFieldCount(); i++) {
+    configFieldValue(i, value, sizeof(value));
+    Serial.printf("  %-7s  %-10s  %-8s  %-8s  %s\n",
+                  configFieldName(i), value, configFieldRange(i),
+                  configFieldIsLive(i) ? "now" : "restart",
+                  configFieldIsDefault(i) ? "" : "changed");
+  }
+
+  Serial.println();
+  for (uint8_t i = 0; i < configFieldCount(); i++) {
+    Serial.printf("  %-7s  %s\n", configFieldName(i), configFieldHelp(i));
+  }
+  if (configRestartPending()) {
+    Serial.println();
+    Serial.println("  * a restart-only setting has changed - `reboot` to apply it");
+  }
   Serial.println();
 }
 
@@ -167,6 +517,13 @@ static void printStat() {
   Serial.printf("rejects   crc/read %lu  foreign %lu  codec-mismatch %lu  malformed %lu\n",
                 (unsigned long)s.rxErrors, (unsigned long)s.rxForeign,
                 (unsigned long)s.rxCodecMismatch, (unsigned long)s.rxMalformed);
+  if (s.rxBadVersion > 0) {
+    // Its own line because it is the one reject that means "upgrade a
+    // handset" rather than "check your settings".
+    Serial.printf("          %lu packets used a protocol version this build does "
+                  "not speak (we send v%u)\n",
+                  (unsigned long)s.rxBadVersion, (unsigned)VOICE_PROTO_VERSION);
+  }
   if (s.rxNoKey > 0) {
     Serial.printf("          %lu encrypted packets dropped - the other handset "
                   "is armed and this one has no key\n", (unsigned long)s.rxNoKey);
@@ -287,6 +644,86 @@ static void execute(char* cmd) {
   } else if (matches(cmd, "stat", &arg)) {
     printStat();
 
+  } else if (matches(cmd, "version", &arg) || matches(cmd, "ver", &arg)) {
+    // Everything needed to identify this build, on one screenful. The dirty
+    // flag is called out in words rather than a symbol because it is the part
+    // people skip past, and it is the part that invalidates the hash.
+    Serial.println();
+    Serial.printf("firmware  %s\n", versionString());
+    Serial.printf("semver    %s\n", versionSemver());
+    Serial.printf("git       %s on %s%s\n", versionGitRev(), versionGitBranch(),
+                  versionGitDirty()
+                    ? "  (TREE WAS DIRTY - the hash does not identify the source)"
+                    : "");
+    Serial.printf("built     %s\n", versionBuildTimestamp());
+    Serial.printf("protocol  v%u\n", (unsigned)VOICE_PROTO_VERSION);
+    Serial.println();
+
+  } else if (matches(cmd, "config", &arg) || matches(cmd, "cfg", &arg)) {
+    const char* rest = nullptr;
+    if (*arg == '\0' || matches(arg, "show", &rest)) {
+      printConfig();
+
+    } else if (matches(arg, "get", &rest)) {
+      char value[24];
+      if (*rest == '\0')                             Serial.println("usage: config get <name>");
+      else if (configGetByName(rest, value, sizeof(value)))
+        Serial.printf("%s = %s\n", rest, value);
+      else Serial.printf("no setting called '%s' - try `config`\n", rest);
+
+    } else if (matches(arg, "set", &rest)) {
+      configSet(rest);
+
+    } else if (matches(arg, "test", &rest)) {
+      const char* why = nullptr;
+      if (configTestMigration(&why)) {
+        Serial.println("migration self test PASSED - a v1 blob survives intact");
+      } else {
+        Serial.printf("migration self test FAILED: %s\n", why ? why : "?");
+      }
+
+    } else if (matches(arg, "reset", &rest)) {
+      if (configReset()) {
+        applyLiveSettings();
+        Serial.println("config reset to build defaults and saved - reboot to apply fully");
+      } else {
+        Serial.println("config reset in RAM but the NVS write failed");
+      }
+
+    } else {
+      Serial.println("usage: config [show | get <n> | set <n> <v> | reset | test]");
+    }
+
+  } else if (matches(cmd, "post", &arg)) {
+    // Re-runnable on demand. Most items are cheap re-reads; the battery is
+    // measured fresh, which is the main reason to ask for it again - a
+    // reading taken at boot says nothing about the cell twenty minutes of
+    // transmitting later.
+    postRun();
+
+  } else if (matches(cmd, "log", &arg)) {
+    if (strcmp(arg, "raw") == 0) {
+      printLogRaw();
+    } else if (strcmp(arg, "flash") == 0) {
+      printLogFlash(false);
+    } else if (strcmp(arg, "flash raw") == 0 || strcmp(arg, "flashraw") == 0) {
+      printLogFlash(true);
+    } else if (strcmp(arg, "flush") == 0) {
+      // Force it now, regardless of the idle rule. Doing this by hand is what
+      // you want before pulling the battery.
+      const uint32_t n = logFlush();
+      Serial.printf("flushed %lu records to flash\n", (unsigned long)n);
+    } else if (strcmp(arg, "clear") == 0) {
+      logClear();
+      Serial.println("RTC ring cleared - the flash history is untouched");
+      Serial.println("use `log erase` to wipe that too");
+    } else if (strcmp(arg, "erase") == 0) {
+      logEraseFlash();
+      Serial.println("flash log erased");
+    } else {
+      printLog();
+    }
+
   } else if (matches(cmd, "presets", &arg)) {
     printPresets();
 
@@ -369,6 +806,12 @@ static void execute(char* cmd) {
     }
 
   } else if (matches(cmd, "reboot", &arg)) {
+    // Flush first. A reset preserves the RTC ring so nothing would be lost
+    // either way, but a deliberate restart is a free moment to make the flash
+    // history current - and if the next thing after the reboot is somebody
+    // pulling the battery, it is the only moment.
+    const uint32_t n = logFlush();
+    if (n) Serial.printf("flushed %lu log records\n", (unsigned long)n);
     Serial.println("rebooting");
     Serial.flush();
     ESP.restart();

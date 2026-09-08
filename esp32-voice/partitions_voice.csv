@@ -1,0 +1,26 @@
+# Partition table for esp32-voice, 4 MB flash.
+#
+# Derived from the stock huge_app.csv, with one addition: a 64 kB `eventlog`
+# partition that gives the event log somewhere to live that survives power
+# being removed. See docs/02-logging.md.
+#
+# Offsets that MUST NOT move, because moving them destroys what is stored there:
+#
+#   nvs   0x9000   holds the configuration blob (docs/03-config.md). Changing
+#                  its offset or size wipes every setting on every board that
+#                  is reflashed, including the encryption key.
+#   app0  0x10000  standard; the bootloader looks here.
+#
+# The 64 kB log is carved out of what huge_app.csv gave to spiffs, which this
+# firmware does not use at all. spiffs is kept, smaller, only so that a future
+# addition has somewhere to go without another partition change - and another
+# partition change is a thing to avoid, because it invalidates NVS offsets if
+# anything before it moves.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xE000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x300000,
+eventlog,   data, 0x99,     0x310000, 0x10000,
+spiffs,     data, spiffs,   0x320000, 0xD0000,
+coredump,   data, coredump, 0x3F0000, 0x10000,

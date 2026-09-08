@@ -27,7 +27,9 @@
 
 #include "codec.h"
 #include "config.h"
+#include "configstore.h"
 #include "crypto.h"
+#include "log.h"
 #include "ui.h"
 
 // The FSK FIFO on this chip is 64 bytes and RadioLib will not split a packet
@@ -317,14 +319,22 @@ static void handleRx() {
     return;
   }
 
+  // Version before anything else that depends on the layout. A packet from a
+  // future protocol has fields we would misread, and misreading them means
+  // decoding noise into somebody's ear rather than declining politely.
+  if (buf[1] != VOICE_PROTO_VERSION) {
+    stats.rxBadVersion++;
+    return;
+  }
+
   // Unpack the header. Little endian, byte at a time, so this does not depend
   // on the compiler's struct packing or the machine's alignment rules.
-  const uint8_t  flags       = buf[1];
+  const uint8_t  flags       = buf[2];
   const uint8_t  pktCodecId  = (flags & VOICE_FLAG_CODEC_MASK) >> VOICE_FLAG_CODEC_SHIFT;
-  const uint32_t streamId    = (uint32_t)buf[2] | ((uint32_t)buf[3] << 8) |
-                               ((uint32_t)buf[4] << 16) | ((uint32_t)buf[5] << 24);
-  const uint16_t seq         = (uint16_t)buf[6] | ((uint16_t)buf[7] << 8);
-  const uint8_t  station     = buf[8];
+  const uint32_t streamId    = (uint32_t)buf[3] | ((uint32_t)buf[4] << 8) |
+                               ((uint32_t)buf[5] << 16) | ((uint32_t)buf[6] << 24);
+  const uint16_t seq         = (uint16_t)buf[7] | ((uint16_t)buf[8] << 8);
+  const uint8_t  station     = buf[9];
 
   if (pktCodecId != codecId()) {
     // The far end is built for a different bit rate. Decoding it would produce
@@ -440,6 +450,12 @@ static void linkTask(void* arg) {
         const int16_t state = applyPreset(p);
         if (state == RADIOLIB_ERR_NONE) {
           presetIndex = want;
+          logInfo(LOG_MOD_RADIO, LOG_EV_PRESET, (int32_t)want,
+                  (int32_t)airtimeMs);
+          // In "remember last used" mode this schedules a save; in "fixed"
+          // mode it does nothing at all. Either way it does not write flash
+          // here - linkTask is the last place that should stall on an erase.
+          configNotePreset(want);
           if (p.kind == PRESET_SELFTEST) {
             Serial.printf("[link] preset %u: %s - radio parked\n",
                           (unsigned)want, p.label);
@@ -530,6 +546,9 @@ static void linkTask(void* arg) {
 // but unlikely, and VOICE_STATION_ID pins it if you care.
 // -----------------------------------------------------------------------------
 static uint8_t deriveStationId() {
+  // A configured id wins over everything: it is the number somebody wrote on
+  // the case, and it should not change because the board was reflashed.
+  if (config().stationId != 0) return config().stationId;
 #ifdef VOICE_STATION_ID
   return (uint8_t)VOICE_STATION_ID;
 #else
@@ -543,6 +562,10 @@ uint8_t linkStationId() { return stationId; }
 
 bool linkBegin() {
   stationId = deriveStationId();
+
+  // The boot preset is a stored setting; the mode button moves the LIVE
+  // preset and deliberately does not change what the board comes up on.
+  presetIndex = requestedPreset = config().preset % VOICE_PRESET_COUNT;
 
   txQueue = xQueueCreate(VOICE_TX_QUEUE_PACKETS, sizeof(TxPacket));
   rxQueue = xQueueCreate(VOICE_RX_QUEUE_FRAMES, VOICE_MAX_BYTES_PER_FRAME);
@@ -561,12 +584,16 @@ bool linkBegin() {
 
   int16_t state = applyPreset(probe);
   if (state != RADIOLIB_ERR_NONE) {
+    logError(LOG_MOD_RADIO, LOG_EV_RADIO_FAIL, (int32_t)state);
     Serial.printf("[link] SX1276 init failed, RadioLib code %d\n", state);
     Serial.println("[link] check SPI wiring: SCK 5, MISO 19, MOSI 27, CS 18, RST 23");
     return false;
   }
   if (&probe != &boot) applyPreset(boot);
 
+  // Frequency in kHz so it fits an int32 exactly; power in dBm.
+  logInfo(LOG_MOD_RADIO, LOG_EV_RADIO_UP,
+          (int32_t)(probe.freqMHz * 1000.0f), (int32_t)probe.powerDbm);
   Serial.printf("[link] SX1276 up, station id %u\n", (unsigned)stationId);
   Serial.println("[link] presets:");
   for (uint8_t i = 0; i < VOICE_PRESET_COUNT; i++) {
@@ -661,14 +688,15 @@ bool linkSendFrames(const uint8_t* frames, uint8_t count, bool endOfStream) {
   if (encrypt) flags |= VOICE_FLAG_ENCRYPTED;
 
   pkt.data[0] = VOICE_PKT_MAGIC;
-  pkt.data[1] = flags;
-  pkt.data[2] = (uint8_t)(txStreamId);
-  pkt.data[3] = (uint8_t)(txStreamId >> 8);
-  pkt.data[4] = (uint8_t)(txStreamId >> 16);
-  pkt.data[5] = (uint8_t)(txStreamId >> 24);
-  pkt.data[6] = (uint8_t)(txSeq);
-  pkt.data[7] = (uint8_t)(txSeq >> 8);
-  pkt.data[8] = stationId;
+  pkt.data[1] = VOICE_PROTO_VERSION;
+  pkt.data[2] = flags;
+  pkt.data[3] = (uint8_t)(txStreamId);
+  pkt.data[4] = (uint8_t)(txStreamId >> 8);
+  pkt.data[5] = (uint8_t)(txStreamId >> 16);
+  pkt.data[6] = (uint8_t)(txStreamId >> 24);
+  pkt.data[7] = (uint8_t)(txSeq);
+  pkt.data[8] = (uint8_t)(txSeq >> 8);
+  pkt.data[9] = stationId;
   memcpy(pkt.data + VOICE_PKT_HEADER, frames, payload);
 
   if (encrypt) {

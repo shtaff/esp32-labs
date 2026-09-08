@@ -37,8 +37,35 @@ const char* codecNameForId(uint8_t id);
 
 // bits[] must have room for codecBytesPerFrame(), samples[] for
 // codecSamplesPerFrame(). Both record their own execution time.
+//
+// BOTH MUST BE CALLED FROM voiceTask AND NOWHERE ELSE. Two reasons, and the
+// second one bites even when the first does not:
+//
+//   1. A Codec2 instance carries mutable analysis and synthesis state. Two
+//      callers interleaved corrupt it, and the symptom is bad audio rather
+//      than anything that looks like a threading bug.
+//   2. The decode path alone puts more than 8 kB of FFT working set on the
+//      stack in a single frame. voiceTask is sized for that; no other task in
+//      this firmware is, and the Arduino loop task certainly is not.
+//
+// codecCallerOk() below exists because this rule has now been broken twice.
 void codecEncode(uint8_t* bits, const int16_t* samples);
 void codecDecode(int16_t* samples, const uint8_t* bits);
+
+// Measures one encode+decode round trip on a frame of silence, once, and
+// caches the result. MUST be called from voiceTask, for the reasons above -
+// which is exactly why the power-on self test cannot measure this itself and
+// reads the cached figure instead.
+void     codecBench();
+uint32_t codecBenchUs();   // 0 until codecBench() has run
+
+// False once encode or decode has been called from more than one task.
+//
+// A guard rather than an assertion, because the failure it catches is a stack
+// overflow inside a DSP routine three calls deep - which lands as a corrupted
+// backtrace pointing at nothing useful, and took two goes to diagnose. This
+// turns it into a line of text naming the mistake.
+bool codecCallerOk();
 
 // Rolling mean execution time, microseconds. This is the number that decides
 // whether a codec mode is usable on this hardware: encode has to finish inside

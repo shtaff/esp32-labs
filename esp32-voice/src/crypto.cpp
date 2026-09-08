@@ -18,58 +18,44 @@
 #include <mbedtls/aes.h>
 
 #include "config.h"
+#include "configstore.h"
+#include "log.h"
 
 static mbedtls_aes_context aes;
 static bool  keyOk = false;
 static char  problem[48] = "";
 static char  fingerprint[8] = "----";
 
-// One hex character to its value, or -1 if it is not hex. Used instead of
-// strtol so that a malformed key is reported at the character that broke it
-// rather than silently parsing as far as it can and zero-filling the rest.
-static int hexNibble(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
-}
+// Hex parsing lives in configstore.cpp now, along with the range checking for
+// every other setting. This file only ever sees 16 raw bytes.
 
 bool cryptoBegin() {
-  const char* hex = VOICE_KEY_HEX;
-  uint8_t key[VOICE_KEY_BYTES];
+  // The key comes from the config store and nowhere else.
+  //
+  // That is the single path on purpose: configBegin() parses VOICE_KEY_HEX
+  // from secrets.ini into the defaults, and anything set later with
+  // `config set key` replaces it there. Reading secrets.ini again here would
+  // give two sources of truth that disagree the moment somebody changes the
+  // key over the serial line - and the disagreement would present as "the
+  // other handset cannot hear me", which is a long way from its cause.
+  //
+  // The all-zero rejection now lives in two places, and both are load-bearing:
+  // configstore.cpp refuses to STORE one, and the keySet flag below refuses to
+  // USE one. An all-zero AES key is a published key, and a handset that showed
+  // ENC while using one would be lying about the only thing encryption is for.
+  const VoiceConfig& cfg = config();
 
-  if (strlen(hex) != VOICE_KEY_BYTES * 2) {
-    snprintf(problem, sizeof(problem), "key is %u hex chars, want %u",
-             (unsigned)strlen(hex), (unsigned)(VOICE_KEY_BYTES * 2));
-    Serial.printf("[crypto] %s\n", problem);
-    return false;
-  }
-
-  // Parse 32 hex characters into 16 bytes, ORing everything together as we go
-  // so the all-zero test below costs nothing extra.
-  uint8_t orAll = 0;
-  for (int i = 0; i < VOICE_KEY_BYTES; i++) {
-    int hi = hexNibble(hex[i * 2]);
-    int lo = hexNibble(hex[i * 2 + 1]);
-    if (hi < 0 || lo < 0) {
-      snprintf(problem, sizeof(problem), "key is not hex at char %d", i * 2);
-      Serial.printf("[crypto] %s\n", problem);
-      return false;
-    }
-    key[i] = (uint8_t)((hi << 4) | lo);
-    orAll |= key[i];
-  }
-
-  // All zero is the sentinel from platformio.ini, meaning nobody has created a
-  // secrets.ini yet. Refusing it is the point: an all-zero AES key is a
-  // published key, and a handset that showed ENC while using one would be
-  // lying about the only thing encryption is for.
-  if (orAll == 0) {
-    snprintf(problem, sizeof(problem), "no key in secrets.ini");
-    Serial.println("[crypto] key is all zero - see secrets.ini.example");
+  if (!cfg.keySet) {
+    snprintf(problem, sizeof(problem), "no key configured");
+    Serial.println("[crypto] no key: put one in secrets.ini, or run");
+    Serial.println("[crypto]   config set key <32 hex characters>");
     Serial.println("[crypto] encryption cannot be armed; the link runs in clear");
+    logWarn(LOG_MOD_CRYPTO, LOG_EV_CRYPTO_KEY, 0, 0);
     return false;
   }
+
+  uint8_t key[VOICE_KEY_BYTES];
+  memcpy(key, cfg.key, sizeof(key));
 
   mbedtls_aes_init(&aes);
   if (mbedtls_aes_setkey_enc(&aes, key, VOICE_KEY_BYTES * 8) != 0) {
@@ -91,6 +77,10 @@ bool cryptoBegin() {
   problem[0] = '\0';
   Serial.printf("[crypto] AES-128 key loaded, fingerprint %s\n", fingerprint);
   Serial.println("[crypto] both handsets must show the same fingerprint");
+  // The fingerprint goes in the log as a number so a dump can prove which
+  // key a board was carrying without recording the key itself.
+  logInfo(LOG_MOD_CRYPTO, LOG_EV_CRYPTO_KEY, 1,
+          (int32_t)((out[0] << 8) | out[1]));
   return true;
 }
 

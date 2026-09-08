@@ -37,8 +37,10 @@
 #include "buttons.h"
 #include "codec.h"
 #include "config.h"
+#include "configstore.h"
 #include "crypto.h"
 #include "link.h"
+#include "log.h"
 #include "ui.h"
 
 static VoiceState state = VOICE_IDLE;
@@ -135,6 +137,7 @@ static void onButton(ButtonEvent e) {
 
     case BTN_MODE_DOUBLE:
       if (linkSetEncryption(!linkEncryption())) {
+        logInfo(LOG_MOD_CRYPTO, LOG_EV_ENC_STATE, linkEncryption() ? 1 : 0);
         uiFlash(linkEncryption() ? "ENCRYPTED" : "CLEAR",
                 linkEncryption() ? cryptoFingerprint() : "anyone can listen",
                 1200);
@@ -217,10 +220,25 @@ static void runTx() {
 
   audioSetDirection(AUDIO_DIR_MIC);   // blocks for the microphone settle
   linkStreamBegin();
+  const uint32_t txStartMs = millis();
+  const uint32_t txClipStart = audioClipCount();
+  logInfo(LOG_MOD_APP, LOG_EV_TX_START, (int32_t)linkPresetIndex(),
+          (int32_t)(audioTestSignalActive() ? 1 : 0));
 
   uint8_t packed = 0;   // frames accumulated toward the next packet
 
+  // A hard limit on one transmission, if configured. A stuck PTT button - or
+  // a handset sat on in a rucksack - otherwise transmits until the battery
+  // dies, jamming the channel for everyone and spending the duty budget for
+  // the whole hour in the first two minutes of it.
+  const uint32_t txLimitMs = (uint32_t)config().txMaxSeconds * 1000UL;
+  bool timedOut = false;
+
   while (buttonsPttHeld()) {
+    if (txLimitMs && (millis() - txStartMs) >= txLimitMs) {
+      timedOut = true;
+      break;
+    }
     audioCaptureFrame(pcm);
     codecEncode(packing + (size_t)packed * bytesPerFrame, pcm);
     packed++;
@@ -251,6 +269,24 @@ static void runTx() {
   // it would show IDLE on the display while the PA was still running.
   linkWaitTxIdle(2000);
 
+  if (timedOut) {
+    // Say so loudly: from the operator's side a transmission that stopped
+    // on its own is indistinguishable from a radio that died.
+    uiFlash("TX TIMEOUT", "release PTT", 2000);
+    Serial.printf("[app] transmit stopped at the %us limit\n",
+                  (unsigned)config().txMaxSeconds);
+  }
+
+  // Clipping is recorded per transmission rather than as a running total,
+  // because "this over was distorted" is the useful unit - a lifetime
+  // counter cannot tell you which one.
+  const uint32_t clipped = audioClipCount() - txClipStart;
+  logInfo(LOG_MOD_APP, LOG_EV_TX_END, (int32_t)linkStats().packetsTx,
+          (int32_t)(millis() - txStartMs));
+  if (clipped) {
+    logWarn(LOG_MOD_AUDIO, LOG_EV_AUDIO_CLIP, (int32_t)clipped);
+  }
+
   setState(VOICE_IDLE);
 }
 
@@ -268,10 +304,18 @@ static void runRx() {
   const uint32_t frameMs = codecFrameMs();
   // Round up: a pre-roll that is one frame short of the intended figure is
   // worse than one frame over.
-  const uint16_t preroll = (uint16_t)((VOICE_PREROLL_MS + frameMs - 1) / frameMs);
+  // Read from the config every time rather than cached: preroll is a live
+  // setting, and somebody adjusting it wants the next over to use it.
+  const uint32_t prerollMs = config().prerollMs;
+  const uint16_t preroll = (uint16_t)((prerollMs + frameMs - 1) / frameMs);
 
   audioResetLevel();
   audioSetDirection(AUDIO_DIR_SPK);
+
+  const uint32_t rxUnderrunStart = underruns;
+  const uint32_t rxPacketsStart = linkStats().packetsRx;
+  logInfo(LOG_MOD_APP, LOG_EV_RX_START, (int32_t)linkStats().lastStation,
+          (int32_t)linkStats().lastRssi);
 
   // "Someone is transmitting." This lands inside the pre-roll wait below,
   // which is dead time that already existed, so the cue is genuinely free - it
@@ -281,7 +325,7 @@ static void runRx() {
   // Fill the jitter buffer. Bail out early if the far end has already stopped
   // - a very short transmission may be over before the pre-roll is met, and
   // waiting for audio that will never arrive would clip it entirely.
-  const uint32_t prerollDeadline = millis() + VOICE_PREROLL_MS * 3;
+  const uint32_t prerollDeadline = millis() + prerollMs * 3;
   while (linkRxFrameCount() < preroll) {
     if (buttonsPttHeld())            { setState(VOICE_TX); return; }
     if (linkRxStreamEnded())         break;
@@ -322,6 +366,16 @@ static void runRx() {
   // that most needs marking. Deciding locally means "they finished" and "they
   // vanished" get different sounds instead of one sound and silence.
   audioPlayCue(signedOff ? AUDIO_CUE_ROGER : AUDIO_CUE_LOST);
+
+  // b distinguishes a clean sign-off from a station that vanished, which is
+  // the same distinction the closing cue makes audible.
+  logInfo(LOG_MOD_APP, LOG_EV_RX_END,
+          (int32_t)(linkStats().packetsRx - rxPacketsStart),
+          signedOff ? 1 : 0);
+  if (underruns > rxUnderrunStart) {
+    logWarn(LOG_MOD_AUDIO, LOG_EV_AUDIO_UNDERRUN,
+            (int32_t)(underruns - rxUnderrunStart));
+  }
 
   setState(VOICE_IDLE);
 }
@@ -382,6 +436,8 @@ static void runSelfTestRecord() {
     selfTestFrames++;
   }
 
+  logInfo(LOG_MOD_AUDIO, LOG_EV_SELFTEST, (int32_t)selfTestFrames,
+          (int32_t)(selfTestFrames * codecFrameMs()));
   setState(VOICE_TEST_PLAY);
 }
 
@@ -408,8 +464,23 @@ static void runSelfTestPlay() {
   setState(VOICE_IDLE);
 }
 
+// Set by voiceTask once it has benched the codec, so appBegin() can wait for
+// it rather than assume a scheduling order.
+static volatile bool codecBenched = false;
+
 static void voiceTask(void* arg) {
   (void)arg;
+
+  // Bench the codec before entering the state machine, on THIS task's stack.
+  //
+  // This is here rather than in postRun() because Codec2's decode path alone
+  // puts more than 8 kB of FFT working set in a single frame - more than the
+  // Arduino loop task has in total, which is exactly how the first attempt at
+  // this crashed. It is also the task that owns the codec, and nothing else
+  // may touch it: see codecCallerOk().
+  codecBench();
+  codecBenched = true;
+
   for (;;) {
     switch (state) {
       case VOICE_TX:        runTx();             break;
@@ -437,11 +508,21 @@ void appBegin() {
     return;
   }
 
+  // Wait for the codec bench before returning, so that everything after
+  // appBegin() - the power-on self test in particular - can rely on the figure
+  // being there. voiceTask is higher priority than this one and pinned to the
+  // same core, so in practice it has already finished; the wait is here so
+  // that "in practice" is not load-bearing.
+  for (int i = 0; i < 100 && !codecBenched; i++) delay(5);
+  if (!codecBenched) {
+    Serial.println("[app] codec bench did not complete - voiceTask may be stuck");
+  }
+
   buttonsBegin(onButton);
 
-#ifdef VOICE_ENCRYPT_ON_BOOT
-  linkSetEncryption(true);
-#endif
+  // Arming at boot is a stored setting now, not a build flag: the build flag
+  // only supplies its default (see fillDefaults in configstore.cpp).
+  if (config().encryptOnBoot) linkSetEncryption(true);
 
   Serial.println("[app] ready");
   Serial.printf("[app] station %u; hold PTT (GPIO%d) to talk; MODE (GPIO%d): "

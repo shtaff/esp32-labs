@@ -6,3 +6,7 @@
 
 # Local secrets: the shared AES key. See secrets.ini.example.
 secrets.ini
+
+# Generated at build time by scripts/build_info.py. Committing it would mean
+# every commit dirties the tree that the next commit then records.
+include/build_info.h

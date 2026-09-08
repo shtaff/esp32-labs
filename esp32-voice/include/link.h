@@ -18,21 +18,28 @@
 //     0      1    magic      VOICE_PKT_MAGIC. A one-byte filter for the other
 //                            traffic on a public band, before anything else is
 //                            trusted. Never encrypted.
-//     1      1    flags      bit 0    payload is encrypted
+//     1      1    version    VOICE_PROTO_VERSION. Second, so that it is the
+//                            second thing checked and every later field can be
+//                            interpreted knowing which layout it is in. A
+//                            receiver that does not implement this version
+//                            says so and drops the packet rather than decoding
+//                            a layout it does not understand into somebody's
+//                            ear. Never encrypted.
+//     2      1    flags      bit 0    payload is encrypted
 //                            bit 1    last packet of this transmission
 //                            bits 4-7 codec id, so a receiver configured for a
 //                                     different bit rate can say so instead of
 //                                     playing noise. Never encrypted.
-//     2      4    streamId   random per PTT press, little endian. Identifies
+//     3      4    streamId   random per PTT press, little endian. Identifies
 //                            one transmission, resets the receiver's jitter
 //                            buffer, and is part of the AES counter block.
-//     6      2    seq        packet counter within the stream, little endian,
+//     7      2    seq        packet counter within the stream, little endian,
 //                            from zero. Detects loss, and is part of the
 //                            counter block.
-//     8      1    station    who is talking. Derived from the board's MAC
-//                            unless VOICE_STATION_ID pins it. Also folded into
-//                            the counter block - see below.
-//     9      ..   frames     VOICE_FRAMES_PER_PACKET codec frames, back to
+//     9      1    station    who is talking. Derived from the board's MAC
+//                            unless configured. Also folded into the counter
+//                            block - see below.
+//    10      ..   frames     VOICE_FRAMES_PER_PACKET codec frames, back to
 //                            back. Encrypted as one run when armed.
 //
 // The header stays in clear because the receiver needs streamId, seq and
@@ -56,8 +63,17 @@
 
 #include "config.h"
 
+// Over-the-air protocol version. See docs/05-protocol.md.
+//
+// This moves on its own rules, independently of the firmware version in
+// version.h: it changes only when the bytes on the air change, and two
+// handsets care about this number and nothing else. A receiver rejects any
+// packet whose version it does not implement, and says so, rather than
+// decoding a layout it does not understand into somebody's ear.
+#define VOICE_PROTO_VERSION 1
+
 #define VOICE_PKT_MAGIC   0x56    // 'V'
-#define VOICE_PKT_HEADER  9
+#define VOICE_PKT_HEADER  10
 
 #define VOICE_FLAG_ENCRYPTED  0x01
 #define VOICE_FLAG_END        0x02
@@ -121,6 +137,10 @@ struct LinkStats {
                            // full - the transmitter is not keeping up
   uint32_t rxForeign;      // wrong magic: somebody else's traffic, or noise
                            // that got through the CRC
+  uint32_t rxBadVersion;   // right magic, a protocol version we do not speak.
+                           // Its own counter because it is the one reject that
+                           // means "upgrade one of the handsets" rather than
+                           // "check your settings"
   uint32_t rxCodecMismatch;// right magic, wrong codec id - the far end is
                            // built for a different bit rate
   uint32_t rxNoKey;        // encrypted traffic arriving with no key loaded.

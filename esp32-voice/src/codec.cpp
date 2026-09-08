@@ -17,6 +17,7 @@
 #include <codec2.h>
 
 #include "config.h"
+#include "log.h"
 
 static struct CODEC2* c2 = nullptr;
 static int  samplesPerFrame = 0;
@@ -30,6 +31,37 @@ static uint32_t frameMs     = 0;
 // took 4000 seconds would have tripped the watchdog long before.
 static uint32_t encUsAvg = 0, decUsAvg = 0;
 static uint32_t encUsPeak = 0, decUsPeak = 0;
+
+static uint32_t benchUs = 0;
+
+// -----------------------------------------------------------------------------
+// Which task owns the codec.
+//
+// Recorded on the first encode or decode and checked on every one after. This
+// exists because the rule has been broken twice, and both times the symptom
+// was a stack canary trip deep inside Codec2 with a backtrace that named a DSP
+// routine rather than the caller that had no business being there.
+//
+// xTaskGetCurrentTaskHandle() is a read of a per-core pointer, so this costs
+// essentially nothing at twenty-five frames a second - and it converts an
+// afternoon of reading register dumps into one line of text.
+// -----------------------------------------------------------------------------
+static TaskHandle_t owner = nullptr;
+static bool ownerViolated = false;
+
+static void checkOwner(const char* what) {
+  TaskHandle_t self = xTaskGetCurrentTaskHandle();
+  if (owner == nullptr) {
+    owner = self;
+    return;
+  }
+  if (self == owner || ownerViolated) return;
+
+  ownerViolated = true;
+  Serial.printf("[codec] %s called from task '%s', but the codec belongs to '%s'\n",
+                what, pcTaskGetTaskName(self), pcTaskGetTaskName(owner));
+  Serial.println("[codec] that corrupts codec state and overflows the caller's stack");
+}
 
 static inline void accumulate(uint32_t& avg, uint32_t& peak, uint32_t sample) {
   avg = avg - (avg >> 4) + (sample >> 4);
@@ -78,6 +110,8 @@ bool codecBegin() {
                 (unsigned)VOICE_FRAMES_PER_PACKET,
                 (unsigned long)(frameMs * VOICE_FRAMES_PER_PACKET),
                 bytesPerFrame * VOICE_FRAMES_PER_PACKET);
+  logInfo(LOG_MOD_CODEC, LOG_EV_CODEC_UP, (int32_t)codecId(),
+          (int32_t)bytesPerFrame);
   return true;
 }
 
@@ -118,6 +152,7 @@ const char* codecModeName() { return codecNameForId(codecId()); }
 // is 16 bits on xtensa - and is needed because Codec2's API predates stdint
 // being used consistently.
 void codecEncode(uint8_t* bits, const int16_t* samples) {
+  checkOwner("codecEncode");
   if (c2 == nullptr) {
     memset(bits, 0, bytesPerFrame);
     return;
@@ -131,6 +166,7 @@ void codecEncode(uint8_t* bits, const int16_t* samples) {
 // error, because Codec2 has no way to know its input was damaged. Keeping the
 // LoRa CRC on is what stops that noise reaching the speaker.
 void codecDecode(int16_t* samples, const uint8_t* bits) {
+  checkOwner("codecDecode");
   if (c2 == nullptr) {
     memset(samples, 0, sizeof(int16_t) * samplesPerFrame);
     return;
@@ -139,6 +175,43 @@ void codecDecode(int16_t* samples, const uint8_t* bits) {
   codec2_decode(c2, (short*)samples, bits);
   accumulate(decUsAvg, decUsPeak, micros() - t0);
 }
+
+// -----------------------------------------------------------------------------
+// One encode+decode round trip on silence, timed.
+//
+// Measured HERE rather than in post.cpp because it has to run on voiceTask's
+// stack - the decode path alone puts more than 8 kB of FFT working set in a
+// single frame, which is more than the Arduino loop task has in total.
+//
+// "Did codec2_create() succeed" is necessary but nowhere near sufficient: a
+// codec that runs slower than real time initialises perfectly and then
+// produces broken audio. The number that matters is how long a frame actually
+// takes against the frame period.
+// -----------------------------------------------------------------------------
+void codecBench() {
+  if (c2 == nullptr) return;
+
+  static int16_t probe[VOICE_MAX_SAMPLES_PER_FRAME];
+  uint8_t bits[VOICE_MAX_BYTES_PER_FRAME];
+  memset(probe, 0, sizeof(int16_t) * samplesPerFrame);
+
+  const uint32_t t0 = micros();
+  codecEncode(bits, probe);
+  codecDecode(probe, bits);
+  benchUs = micros() - t0;
+
+  // Silence is not representative of speech - the pitch estimator has nothing
+  // to lock onto - so this understates the real cost. It is a floor, and a
+  // floor that already exceeds the frame budget is decisive on its own. The
+  // rolling averages take over once real audio has been through.
+  Serial.printf("[codec] bench: encode+decode %luus on silence, %lu%% of the %lums frame\n",
+                (unsigned long)benchUs,
+                (unsigned long)(frameMs ? benchUs / (frameMs * 10) : 0),
+                (unsigned long)frameMs);
+}
+
+uint32_t codecBenchUs()      { return benchUs; }
+bool     codecCallerOk()     { return !ownerViolated; }
 
 uint32_t codecEncodeUs()     { return encUsAvg; }
 uint32_t codecDecodeUs()     { return decUsAvg; }
