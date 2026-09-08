@@ -145,6 +145,64 @@
 // Onboard LED. Lit while transmitting, blinked on a received packet.
 #define PIN_LED         25
 
+// =============================================================================
+// OPTIONAL: amplifier sense and shutdown, on the MAX98357A's SD_MODE pin.
+//
+// Undefined by default, so a board without this wire behaves exactly as before
+// and the power-on self test keeps reporting the amplifier as ASSERTED.
+// Define it - one wire, no components - and the amplifier becomes MEASURED.
+//
+//     -DPIN_AMP_SD=12      and wire GPIO12 to the breakout's SD pin
+//
+// HOW THE DETECTION WORKS
+//
+// SD_MODE is not a plain logic input. The MAX98357A has an internal 100k
+// PULLDOWN on it, and the breakout adds 1M up to VIN, so the node floats to
+// VIN x 100/1100 - about 0.3 V at 3V3, 0.45 V at 5 V. That is what puts a
+// bare board in (L+R)/2 mode, and it is also a signature nothing else has.
+//
+// That 100k is measured as a DISCHARGE rather than as a voltage: drive the node
+// hard to 3V3, release it to a true high-Z input, wait, read it digitally.
+//
+//     amplifier present : discharges through 100k, tau ~ 3 us  -> LOW
+//     amplifier absent  : only pin leakage, tens of nA          -> HIGH
+//
+// Full-rail separation from one wire and no components, and no ADC in the path.
+// Reading the STATIC level instead - either as a digital input, where both
+// states are logic high, or through the ADC, where 11 dB attenuation compresses
+// everything above ~2 V - is the obvious approach and the weaker one. See
+// ampProbeOnce() in audio.cpp for the measurements behind that.
+//
+// WHY GPIO12 IS SAFE HERE, WHEN IT IS NOT SAFE FOR A BUTTON
+//
+// GPIO12 is the flash-voltage strapping pin and MUST read LOW at boot. A
+// button with a pull-up would read HIGH and set the flash rail to 1.8 V, and
+// the board would never boot - which is why it is not a button.
+//
+// The amplifier's network does the opposite: 100k down against 1M up holds the
+// node near 0.1 V through the ROM bootloader, with GPIO12's own default
+// pull-down helping. It latches LOW, which is the value that is wanted.
+//
+// WHAT IT ALSO BUYS
+//
+// SD_MODE is the amplifier's shutdown control, so the same wire gives a real
+// hardware mute: driving it low actually powers the output stage down instead
+// of feeding it zeros. See holdAmpSilent() in audio.cpp for what that replaces.
+//
+// CAVEAT: GPIO12 is on ADC2, which cannot be read while WiFi is active. This
+// firmware never brings WiFi up, so it does not matter here - but it is the
+// first thing to check if this ever moves into a project that does.
+// =============================================================================
+// ENABLED. Wire the MAX98357A's SD pin to GPIO12 before flashing this.
+//
+// Safe either way: with no wire, nothing discharges the node, the probe reports
+// "nothing attached", and the only thing lost is a POST warning.
+//
+// Measured on this hardware: 15/15 trials low with the amplifier wired, 0/15
+// without. There is no threshold to tune, which is the point of doing it this
+// way - the first version had one, and it was the part that went wrong.
+#define PIN_AMP_SD 12
+
 // -----------------------------------------------------------------------------
 // Button timing. All of it is applied in buttons.cpp, in a task fed by a GPIO
 // interrupt - nothing here is polled.

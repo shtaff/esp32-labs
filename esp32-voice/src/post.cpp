@@ -137,21 +137,27 @@ void postRun() {
     // "Did codec2_create() succeed" is necessary but nowhere near sufficient:
     // a codec that runs slower than real time initialises perfectly and then
     // produces broken audio.
-    const uint32_t us = codecBenchUs();
+    // The WORSE of encode and decode, each against a whole frame period.
+    // Half duplex means only one of them ever runs at a time, so charging one
+    // frame for the sum of both is the wrong budget by a factor of two - which
+    // is exactly the mistake the first version of this check made.
+    const uint32_t us     = codecBenchUs();
     const uint32_t budget = codecFrameMs() * 1000UL;
-    const uint32_t pct = budget ? (us * 100UL / budget) : 0;
+    const uint32_t pct    = budget ? (us * 100UL / budget) : 0;
+    const uint32_t encPct = budget ? (codecBenchEncodeUs() * 100UL / budget) : 0;
+    const uint32_t decPct = budget ? (codecBenchDecodeUs() * 100UL / budget) : 0;
 
     if (us == 0) {
       set(POST_CODEC, POST_WARN, "%s: not benched yet", codecModeName());
-    } else if (pct >= 90) {
-      set(POST_CODEC, POST_FAIL, "%s: %lu%% of frame budget", codecModeName(),
-          (unsigned long)pct);
+    } else if (pct >= 85) {
+      set(POST_CODEC, POST_FAIL, "%s: enc %lu%% dec %lu%% of frame",
+          codecModeName(), (unsigned long)encPct, (unsigned long)decPct);
     } else if (pct >= 60) {
-      set(POST_CODEC, POST_WARN, "%s: %lu%% of frame budget", codecModeName(),
-          (unsigned long)pct);
+      set(POST_CODEC, POST_WARN, "%s: enc %lu%% dec %lu%% of frame",
+          codecModeName(), (unsigned long)encPct, (unsigned long)decPct);
     } else {
-      set(POST_CODEC, POST_PASS, "%s: %luus, %lu%% of budget", codecModeName(),
-          (unsigned long)us, (unsigned long)pct);
+      set(POST_CODEC, POST_PASS, "%s: enc %lu%% dec %lu%% of frame",
+          codecModeName(), (unsigned long)encPct, (unsigned long)decPct);
     }
     if (pct >= 60) logWarn(LOG_MOD_CODEC, LOG_EV_CODEC_SLOW, (int32_t)us,
                            (int32_t)budget);
@@ -192,8 +198,21 @@ void postRun() {
   // ESP32 side of the link was configured, which is the half of it we control.
   if (!audioAmpEnabled()) {
     set(POST_AMP, POST_SKIP, "disabled at build time (-DNO_AMP)");
+  } else if (!audioAmpSensed()) {
+    // ASSERTED, and it says so. Without the SD_MODE sense wire the MAX98357A
+    // has no readback path of any kind, and what we can honestly claim is that
+    // the ESP32 side was configured - the half we control. Wire PIN_AMP_SD and
+    // this item becomes a measurement; see config.h.
+    set(POST_AMP, POST_PASS, "I2S TX ready (not probed - see PIN_AMP_SD)");
+  } else if (audioAmpDetected()) {
+    // MEASURED. The amplifier's internal 100k pulldown discharges the node
+    // after we charge and release it - see ampProbeOnce() in audio.cpp.
+    set(POST_AMP, POST_PASS, "detected, %u/15 trials", (unsigned)audioAmpVotes());
   } else {
-    set(POST_AMP, POST_PASS, "I2S TX ready (amp itself cannot be probed)");
+    // A warning, not a failure: a board with no amplifier is a perfectly good
+    // transmitter, and this rig is deliberately run that way.
+    set(POST_AMP, POST_WARN, "none found, %u/15 trials - nothing will be heard",
+        (unsigned)audioAmpVotes());
   }
 
   // ---- power ---------------------------------------------------------------

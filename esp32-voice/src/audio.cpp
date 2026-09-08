@@ -96,6 +96,13 @@ static bool    forceTestSignal = false;
 static uint32_t captureTimeouts = 0;
 static uint32_t clipCount = 0;
 
+// Amplifier presence, from the optional SD_MODE sense wire. Without it these
+// stay at "assumed present, never measured".
+static bool     ampDetected = true;
+static uint16_t ampSenseMv  = 0;
+static bool     ampPowered  = false;
+static uint8_t  ampVotes    = 0;
+
 static uint8_t level = 0;
 
 // Live settings, adopted from the config store in audioBegin() and changeable
@@ -121,20 +128,150 @@ static float dcPrevOut = 0.0f;
 static int32_t micRaw[2 * VOICE_MAX_SAMPLES_PER_FRAME * VOICE_MIC_OVERSAMPLE];
 static int16_t spkRaw[2 * VOICE_MAX_SAMPLES_PER_FRAME];
 
+// =============================================================================
+// Amplifier presence and shutdown, on the optional SD_MODE wire.
+//
+// See the PIN_AMP_SD block in config.h for the electrical reasoning. In short:
+// the MAX98357A holds SD_MODE down through an internal 100k, so an ESP32
+// pull-up on that node reads ~2.3 V with an amplifier attached and the full
+// rail without one.
+//
+// The probe MUST run before anything drives the pin, which is why audioBegin()
+// calls it first. Once probed the pin becomes an output and stays one.
+// =============================================================================
+#ifdef PIN_AMP_SD
+
+// One charge-and-release trial. True when something pulled the node back down.
+//
+// WHY NOT JUST MEASURE THE VOLTAGE
+//
+// The first version enabled the internal pull-up and read the ADC, expecting
+// ~2.3 V with an amplifier attached and ~3.3 V without. First hardware run gave
+// 1995 mV "attached" and 2067 mV "bare" - 72 mV apart, useless.
+//
+// That turned out to be a MISWIRE: SD was on the wrong pin, so this node was
+// floating in both cases and the two numbers were two samples of the same
+// condition. The voltage method was never actually tested, and the obvious
+// conclusion - "the ADC cannot see it" - was not what the data showed.
+//
+// What the data did show, and why the discharge test was kept anyway:
+//
+//   - A true 3.3 V read back as ~2.07 V. The ESP32 ADC at 11 dB attenuation is
+//     genuinely compressed above ~2 V, and the ~45k internal pull-up is far
+//     above the ~10k source impedance the ADC wants, so the sample-and-hold
+//     never fully charges either.
+//   - Two samples of an IDENTICAL condition differed by 72 mV. That is this
+//     measurement's noise floor.
+//
+// So the voltage method would have had ~170 mV of signal against ~70 mV of
+// noise - about 2.4:1. Probably workable. The discharge test gets the whole
+// rail and measures 15/15 versus 0/15 on the same hardware.
+//
+// WHAT THIS DOES INSTEAD
+//
+// It measures the amplifier's internal 100k pulldown as a DISCHARGE, digitally,
+// with the whole rail as margin:
+//
+//   1. drive the node hard to 3V3
+//   2. release to a true high-Z input - no internal pull of any kind, because a
+//      pull would define the very thing being measured
+//   3. wait, then read the pin as a plain digital input
+//
+//   amplifier present : discharges through its 100k toward ~0.3 V.
+//                       tau = (100k || 1M) x ~35 pF, about 3 us - long settled
+//                       by the time we look.               -> reads LOW
+//   amplifier absent  : nothing discharges it. Pin leakage is tens of nA, which
+//                       over 200 us moves 35 pF by a fraction of a volt.
+//                                                          -> reads HIGH
+//
+// Full-rail separation, no ADC, no external components.
+static bool ampProbeOnce() {
+  pinMode(PIN_AMP_SD, OUTPUT);
+  digitalWrite(PIN_AMP_SD, HIGH);
+  delayMicroseconds(500);          // charge the node, and any wire capacitance
+
+  pinMode(PIN_AMP_SD, INPUT);      // true high-Z: INPUT means no pull on ESP32
+  delayMicroseconds(200);          // ~60 time constants if an amp is there
+
+  return digitalRead(PIN_AMP_SD) == LOW;
+}
+
+static void probeAmp() {
+  // A vote, because one trial is one sample of a node with a wire on it. A
+  // clean answer is unanimous; anything in between means a marginal joint,
+  // which is worth seeing rather than rounding away.
+  const uint8_t trials = 15;
+  uint8_t low = 0;
+  for (uint8_t i = 0; i < trials; i++) {
+    if (ampProbeOnce()) low++;
+    delayMicroseconds(200);
+  }
+  ampVotes    = low;
+  ampDetected = (low > trials / 2);
+
+  // The settled voltage, for the boot log only - never for the decision. It is
+  // informative when an amplifier IS present (a few hundred millivolts) and
+  // close to meaningless when one is not, because a floating pin read through
+  // an ADC compressed above 2 V is the reading discussed above.
+  pinMode(PIN_AMP_SD, INPUT);
+  delayMicroseconds(500);
+  uint32_t mv = 0;
+  for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(PIN_AMP_SD);
+  ampSenseMv = (uint16_t)(mv / 8);
+
+  Serial.printf("[audio] amplifier sense on GPIO%d: %u/%u trials pulled low, "
+                "resting %u mV -> %s\n",
+                PIN_AMP_SD, (unsigned)low, (unsigned)trials,
+                (unsigned)ampSenseMv,
+                ampDetected ? "MAX98357A present" : "nothing attached");
+}
+#endif
+
+// Drives SD_MODE, when it is wired.
+//
+// This is a REAL shutdown, not the digital-silence trick below: the amplifier's
+// output stage powers down and stops drawing its couple of milliamps, rather
+// than continuing to switch while being fed zeros.
+//
+// High is above the 1.4 V threshold, which selects the left channel. That does
+// not matter here because playback duplicates every sample into both slots -
+// see the channel-format discussion at the top of this file.
+static void ampPower(bool on) {
+#ifdef PIN_AMP_SD
+  const bool wasOff = !ampPowered;
+  pinMode(PIN_AMP_SD, OUTPUT);
+  digitalWrite(PIN_AMP_SD, on ? HIGH : LOW);
+  ampPowered = on;
+
+  // Coming out of shutdown takes the part a few milliseconds, and it wants a
+  // valid bit clock while it does - which is why every caller starts the I2S
+  // driver BEFORE calling this, never after. Without the wait the first few
+  // milliseconds of whatever plays next are simply not amplified, which on a
+  // 60 ms cue tone is an audibly clipped attack.
+  if (on && wasOff) delay(10);
+#else
+  (void)on;
+#endif
+}
+
 // -----------------------------------------------------------------------------
 // The amplifier's data line when we are not driving it.
 //
-// The MAX98357A has no shutdown pin wired here, so while the bit clock is
-// running - which it is, in AUDIO_DIR_MIC, because both devices share the
-// clocks - it will happily play whatever DIN happens to be doing. Left as an
-// undriven I2S output that is a floating pin, and a floating pin into a class
-// D amplifier is a hiss at full volume.
+// Without the SD_MODE wire the MAX98357A has no shutdown control, so while the
+// bit clock is running - which it is in AUDIO_DIR_MIC, because both devices
+// share the clocks - it will play whatever DIN happens to be doing. An undriven
+// I2S output is a floating pin, and a floating pin into a class D amplifier is
+// a hiss at full volume.
 //
 // Detaching the peripheral from the pad and holding it low feeds the amplifier
 // a legitimate stream of zero samples instead, which is silence. The
 // esp_rom_gpio_connect_out_signal() call is the part that matters: without it
 // the GPIO matrix still routes I2S0's data-out signal to the pad and
 // digitalWrite() has no effect.
+//
+// With PIN_AMP_SD wired this is belt and braces - ampPower(false) has already
+// powered the output stage down - but it costs nothing and it is what keeps a
+// board without that wire quiet.
 // -----------------------------------------------------------------------------
 static void holdAmpSilent() {
   esp_rom_gpio_connect_out_signal(PIN_I2S_DOUT, SIG_GPIO_OUT_IDX, false, false);
@@ -283,6 +420,12 @@ bool audioBegin() {
   gainShift = config().micGainShift;
   cuesOn    = config().cueTones != 0;
 
+#ifdef PIN_AMP_SD
+  // Before anything drives the pin: the measurement only works while the ESP32
+  // is pulling the node up and the amplifier is the only other thing on it.
+  probeAmp();
+#endif
+  ampPower(false);   // stay shut down until there is something to play
   holdAmpSilent();
 
   audioProbeMic();
@@ -310,6 +453,17 @@ uint32_t audioClipCount()   { return clipCount; }
 void     audioResetClipCount() { clipCount = 0; }
 uint32_t audioCaptureRate() { return VOICE_MIC_CAPTURE_RATE; }
 
+bool audioAmpSensed() {
+#ifdef PIN_AMP_SD
+  return true;
+#else
+  return false;
+#endif
+}
+bool     audioAmpDetected() { return ampDetected; }
+uint16_t audioAmpSenseMv()  { return ampSenseMv; }
+uint8_t  audioAmpVotes()    { return ampVotes; }
+
 bool audioAmpEnabled() {
 #ifdef NO_AMP
   return false;
@@ -327,16 +481,23 @@ void audioSetDirection(AudioDir dir) {
   uninstall();
 
   if (dir == AUDIO_DIR_OFF) {
+    ampPower(false);
     holdAmpSilent();
     currentDir = AUDIO_DIR_OFF;
     return;
   }
 
   if (!install(dir)) {
+    ampPower(false);
     holdAmpSilent();
     currentDir = AUDIO_DIR_OFF;
     return;
   }
+
+  // Powered only for playback. In the microphone direction the clocks are still
+  // running into the amplifier - they are shared - so leaving it awake would
+  // burn its quiescent current for the whole of every transmission.
+  ampPower(dir == AUDIO_DIR_SPK);
 
   if (dir == AUDIO_DIR_MIC) {
     // The clocks have just restarted, so the INMP441 is settling again and its

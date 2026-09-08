@@ -178,6 +178,16 @@ is identified by the four-character fingerprint on the SYS screen. Being able to
 bad habit to build into a tool even when the tool is a lab toy. The log records
 the fingerprint, never the bytes.
 
+The console echoes every line it receives as `[cmd] …`, so a captured session
+records what was asked as well as what was answered. The key is masked in that
+echo — both `config set key <hex>` and `key=<hex>` inside a batch come out as
+`key=<hidden>` — including on a line whose command was mistyped and never ran:
+
+```
+> config set key=8f3a2b91c04d76e5a1b8c9d0e2f34567 station=7
+[cmd] config set key=<hidden> station=7
+```
+
 An **all-zero key is refused** at both ends: `configstore` will not store one,
 and `crypto` will not use one. An all-zero AES key is a published key, and a
 handset showing `ENC` while using one would be lying about the only thing

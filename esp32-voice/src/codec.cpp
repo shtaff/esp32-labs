@@ -32,7 +32,9 @@ static uint32_t frameMs     = 0;
 static uint32_t encUsAvg = 0, decUsAvg = 0;
 static uint32_t encUsPeak = 0, decUsPeak = 0;
 
-static uint32_t benchUs = 0;
+// Timed separately: half duplex means each gets a whole frame period.
+static uint32_t benchEncodeUs = 0;
+static uint32_t benchDecodeUs = 0;
 
 // -----------------------------------------------------------------------------
 // Which task owns the codec.
@@ -195,22 +197,44 @@ void codecBench() {
   uint8_t bits[VOICE_MAX_BYTES_PER_FRAME];
   memset(probe, 0, sizeof(int16_t) * samplesPerFrame);
 
-  const uint32_t t0 = micros();
+  // Timed SEPARATELY, and that is the whole point.
+  //
+  // The first version of this timed encode and decode together and compared
+  // the sum against one frame period. That is simply the wrong budget: this is
+  // a HALF-DUPLEX handset. It encodes while transmitting and decodes while
+  // receiving, and it never does both - so each has a whole frame period to
+  // itself. Charging one frame for two frames' work reported 108% on hardware
+  // that was actually running at about 54%, which is a self test manufacturing
+  // an alarm rather than measuring one.
+  uint32_t t0 = micros();
   codecEncode(bits, probe);
+  benchEncodeUs = micros() - t0;
+
+  t0 = micros();
   codecDecode(probe, bits);
-  benchUs = micros() - t0;
+  benchDecodeUs = micros() - t0;
+
+  const uint32_t budget = frameMs * 1000UL;
 
   // Silence is not representative of speech - the pitch estimator has nothing
   // to lock onto - so this understates the real cost. It is a floor, and a
   // floor that already exceeds the frame budget is decisive on its own. The
   // rolling averages take over once real audio has been through.
-  Serial.printf("[codec] bench: encode+decode %luus on silence, %lu%% of the %lums frame\n",
-                (unsigned long)benchUs,
-                (unsigned long)(frameMs ? benchUs / (frameMs * 10) : 0),
+  Serial.printf("[codec] bench on silence: encode %luus (%lu%%), decode %luus (%lu%%) "
+                "of the %lums frame\n",
+                (unsigned long)benchEncodeUs,
+                (unsigned long)(budget ? benchEncodeUs * 100UL / budget : 0),
+                (unsigned long)benchDecodeUs,
+                (unsigned long)(budget ? benchDecodeUs * 100UL / budget : 0),
                 (unsigned long)frameMs);
 }
 
-uint32_t codecBenchUs()      { return benchUs; }
+// The worse of the two, which is the one that has to fit.
+uint32_t codecBenchUs() {
+  return benchEncodeUs > benchDecodeUs ? benchEncodeUs : benchDecodeUs;
+}
+uint32_t codecBenchEncodeUs() { return benchEncodeUs; }
+uint32_t codecBenchDecodeUs() { return benchDecodeUs; }
 bool     codecCallerOk()     { return !ownerViolated; }
 
 uint32_t codecEncodeUs()     { return encUsAvg; }

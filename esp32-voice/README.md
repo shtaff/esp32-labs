@@ -118,7 +118,33 @@ strapping pins narrow it to exactly this.
 | LRC | **GPIO15** | shared with the microphone |
 | DIN | **GPIO13** | |
 | GAIN | leave floating | 9 dB |
-| SD | leave floating | plays (L+R)/2 |
+| SD | **GPIO12** | presence sense + hardware mute — see below |
+
+**`PIN_AMP_SD` is enabled in [config.h](include/config.h)**, so wire SD to
+GPIO12. One wire, no components, and it buys two things:
+
+- **The amplifier becomes detectable.** It has an internal 100 kΩ pulldown on
+  SD_MODE. The pin is charged to 3V3, released to high-Z and read digitally a
+  moment later: an amplifier discharges it, nothing else does. POST goes from
+  *asserted* to *measured*.
+- **A real hardware mute.** SD_MODE is the shutdown control, so the output stage
+  powers down between transmissions instead of being fed zeros.
+
+GPIO12 is the flash-voltage strapping pin and is unusable as a *button* — but
+the amp's network holds it near 0.1 V at boot, which is exactly the level it
+needs. See [config.h](include/config.h).
+
+Leaving the wire off is harmless: nothing discharges the pin, the probe reports
+`none on SD_MODE`, and POST raises a warning rather than a failure.
+
+**What it detects, precisely:** the amplifier's internal 100 kΩ pulldown, seen
+as a discharge. That needs the module's **GND** connected. A module wired for
+ground but with VIN missing would still read as present — an odd failure, but
+worth knowing the test cannot see it.
+
+Measured here: **15/15** trials low wired, **0/15** unwired. The first thing it
+found was a wiring mistake — SD on the wrong GPIO, reported as 0/15 — which is
+what a presence check is for.
 
 ### Buttons
 

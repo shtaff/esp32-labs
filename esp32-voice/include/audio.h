@@ -29,10 +29,26 @@ bool audioBegin();
 // A live INMP441 always delivers at least a couple of LSBs of self-noise.
 bool audioMicPresent();
 
-// False when the build asked for no amplifier (-DNO_AMP). There is no way to
-// detect a MAX98357A - it has no readback path - so an absent amplifier is
-// simply inaudible, which costs nothing and needs no special case.
+// False when the build asked for no amplifier (-DNO_AMP).
 bool audioAmpEnabled();
+
+// -----------------------------------------------------------------------------
+// Amplifier presence.
+//
+// Without PIN_AMP_SD wired, this is unknowable and audioAmpDetected() returns
+// true with audioAmpSenseMv() == 0 - "assumed present", which is what the
+// power-on self test then reports.
+//
+// With it wired, the MAX98357A's SD_MODE pin gives it away: the part has an
+// internal 100k pulldown. The pin is charged to 3V3, released to high-Z, and
+// read digitally a moment later - an amplifier discharges it, nothing else
+// does. See ampProbeOnce() in audio.cpp for why this is a discharge test and
+// not the voltage measurement it obviously should have been.
+// -----------------------------------------------------------------------------
+bool     audioAmpSensed();      // true when PIN_AMP_SD is configured
+bool     audioAmpDetected();    // the measurement, or true when not sensed
+uint8_t  audioAmpVotes();       // trials out of 15 that saw the node pulled low
+uint16_t audioAmpSenseMv();     // resting voltage, for the log only
 
 // Reconfigures the peripheral. Idempotent; a no-op if already in that
 // direction. Switching into AUDIO_DIR_MIC includes the INMP441 settling delay,

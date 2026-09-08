@@ -56,8 +56,17 @@ void codecDecode(int16_t* samples, const uint8_t* bits);
 // caches the result. MUST be called from voiceTask, for the reasons above -
 // which is exactly why the power-on self test cannot measure this itself and
 // reads the cached figure instead.
-void     codecBench();
-uint32_t codecBenchUs();   // 0 until codecBench() has run
+void codecBench();
+
+// Encode and decode are timed SEPARATELY and each is compared against a whole
+// frame period, because this is a half-duplex handset: it encodes while
+// transmitting and decodes while receiving, and never does both. Charging one
+// frame period for both is the wrong budget by a factor of two.
+//
+// codecBenchUs() returns the worse of the pair - the one that has to fit.
+uint32_t codecBenchUs();          // 0 until codecBench() has run
+uint32_t codecBenchEncodeUs();
+uint32_t codecBenchDecodeUs();
 
 // False once encode or decode has been called from more than one task.
 //

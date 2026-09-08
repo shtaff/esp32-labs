@@ -560,9 +560,15 @@ static void printStat() {
   }
   Serial.printf("cues      %s - roger beep is generated here, never transmitted\n",
                 audioCuesEnabled() ? "on" : "off");
-  Serial.printf("amp       %s\n", audioAmpEnabled()
-                ? "MAX98357A assumed present (it has no readback)"
-                : "disabled at build time (-DNO_AMP)");
+  if (!audioAmpEnabled()) {
+    Serial.println("amp       disabled at build time (-DNO_AMP)");
+  } else if (!audioAmpSensed()) {
+    Serial.println("amp       assumed present - not probed, see PIN_AMP_SD in config.h");
+  } else {
+    Serial.printf("amp       %s (%u/15 discharge trials, resting %u mV)\n",
+                  audioAmpDetected() ? "detected" : "NOT DETECTED",
+                  (unsigned)audioAmpVotes(), (unsigned)audioAmpSenseMv());
+  }
   Serial.printf("audio     underruns %lu, capture overruns %lu, level %u%%\n",
                 (unsigned long)appUnderruns(),
                 (unsigned long)audioCaptureTimeouts(), (unsigned)audioLevel());
@@ -622,6 +628,64 @@ static bool matches(const char* s, const char* word, const char** rest) {
 }
 
 // -----------------------------------------------------------------------------
+// Echo of the line just received, with secrets removed.
+//
+// The board does not echo typing, so a captured serial session is otherwise all
+// answers and no questions - which is exactly the wrong half to keep when the
+// session is going into a bug report or a lab notebook. The echo makes a
+// transcript self-contained, and the `[cmd]` prefix makes it greppable
+// alongside the other tagged output.
+//
+// The one thing that must not appear is the AES key. It reaches the console in
+// two shapes:
+//
+//     config set key 000102030405060708090A0B0C0D0E0F
+//     config set key=000102030405060708090A0B0C0D0E0F station=7
+//
+// Both are masked here rather than inside configSet(), because the echo happens
+// before the line has been parsed and so cannot know which command it is
+// looking at. Masking on the token `key` catches every route to that field,
+// including a mistyped command that never reaches a handler at all.
+//
+// Nothing else is secret: `config` already renders the key as <set>, so no
+// other command can put key material on the wire.
+// -----------------------------------------------------------------------------
+static void maskSecrets(const char* in, char* out, size_t cap) {
+  size_t o = 0;
+  bool nextIsSecret = false;    // set by a bare `key` token: the value follows
+
+  const char* p = in;
+  while (*p && o + 1 < cap) {
+    // Separators are copied through, so the echo keeps the spacing that was
+    // typed - which matters when the complaint is "it ignored my argument".
+    while (*p == ' ' && o + 1 < cap) { out[o++] = ' '; p++; }
+    if (!*p) break;
+
+    const char* tok = p;
+    while (*p && *p != ' ') p++;
+    const size_t len = (size_t)(p - tok);
+
+    // keep = how many leading characters of the token survive verbatim,
+    // rep  = what is appended in place of the rest.
+    size_t      keep = len;
+    const char* rep  = nullptr;
+
+    if (nextIsSecret) {
+      keep = 0; rep = "<hidden>";
+      nextIsSecret = false;
+    } else if (len == 3 && strncmp(tok, "key", 3) == 0) {
+      nextIsSecret = true;                 // `config set key <hex>`
+    } else if (len > 4 && strncmp(tok, "key=", 4) == 0) {
+      keep = 4; rep = "<hidden>";          // `key=<hex>` in the batch form
+    }
+
+    for (size_t i = 0; i < keep && o + 1 < cap; i++) out[o++] = tok[i];
+    if (rep) for (const char* r = rep; *r && o + 1 < cap; r++) out[o++] = *r;
+  }
+  out[o] = '\0';   // a pathological line is truncated, never overrun
+}
+
+// -----------------------------------------------------------------------------
 // Run one line. Nothing here touches the radio, the codec or the I2S
 // peripheral directly - every command goes through the same entry point the
 // buttons use, so the console cannot get the state machine into a position the
@@ -635,6 +699,18 @@ static void execute(char* cmd) {
   char* end = cmd + strlen(cmd);
   while (end > cmd && (end[-1] == ' ' || end[-1] == '\r')) *--end = '\0';
   if (*cmd == '\0') return;   // bare newline: no complaint, no output
+
+  // Echoed before anything runs, so the command is on screen above its own
+  // output even when the command reboots the board or takes a visible moment.
+  //
+  // Larger than `line` because masking can make text LONGER: `key=a` is five
+  // characters and `key=<hidden>` is twelve. The worst case is a line made
+  // entirely of six-character `key=a ` tokens, which is 2.2x, so 160 cannot be
+  // reached from a 63-character input. maskSecrets() truncates rather than
+  // overruns in any case.
+  char shown[160];
+  maskSecrets(cmd, shown, sizeof(shown));
+  Serial.printf("[cmd] %s\n", shown);
 
   const char* arg = nullptr;
 
@@ -817,7 +893,9 @@ static void execute(char* cmd) {
     ESP.restart();
 
   } else {
-    Serial.printf("unknown command: %s (try `help`)\n", cmd);
+    // The masked copy, not the raw line: a key typed after a mistyped command
+    // is still a key.
+    Serial.printf("unknown command: %s (try `help`)\n", shown);
   }
 }
 
